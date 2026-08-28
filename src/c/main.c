@@ -352,7 +352,14 @@ static void request_graph(int32_t ride_id) {
 
 static void refresh_timer_callback(void *data) {
   request_refresh();
-  s_refresh_timer = app_timer_register(REFRESH_INTERVAL_MS, refresh_timer_callback, NULL);
+  // Back off to a slower cadence on low, unplugged battery rather than
+  // hitting Bluetooth/AppMessage on the usual 5-minute tick regardless.
+  BatteryChargeState battery = battery_state_service_peek();
+  uint32_t interval = REFRESH_INTERVAL_MS;
+  if (!battery.is_charging && battery.charge_percent <= 20) {
+    interval = REFRESH_INTERVAL_MS * 3;
+  }
+  s_refresh_timer = app_timer_register(interval, refresh_timer_callback, NULL);
 }
 
 // ---------------------------------------------------------------------------
@@ -1220,8 +1227,33 @@ static void inbox_dropped_callback(AppMessageResult reason, void *context) {
   APP_LOG(APP_LOG_LEVEL_ERROR, "Inbox dropped: %d", (int)reason);
 }
 
+static int32_t s_pending_graph_retry_id = 0;
+
+static void retry_request_refresh_callback(void *data) {
+  request_refresh();
+}
+
+static void retry_request_graph_callback(void *data) {
+  request_graph(s_pending_graph_retry_id);
+}
+
 static void outbox_failed_callback(DictionaryIterator *iter, AppMessageResult reason, void *context) {
   APP_LOG(APP_LOG_LEVEL_ERROR, "Outbox failed: %d", (int)reason);
+
+  // Phone-to-watch sends already retry via sendNext() in pkjs; these
+  // watch-initiated requests just got silently dropped before. Retry once
+  // after a short delay instead of waiting for the next periodic refresh
+  // tick, or making the user back out and reopen a ride's detail view.
+  Tuple *t_refresh = dict_find(iter, MESSAGE_KEY_RequestRefresh);
+  if (t_refresh) {
+    app_timer_register(3000, retry_request_refresh_callback, NULL);
+    return;
+  }
+  Tuple *t_graph = dict_find(iter, MESSAGE_KEY_RequestGraph);
+  if (t_graph) {
+    s_pending_graph_retry_id = t_graph->value->int32;
+    app_timer_register(3000, retry_request_graph_callback, NULL);
+  }
 }
 
 static void connection_handler(bool connected) {
