@@ -1,6 +1,7 @@
 {
   "name": "energylandia-queues",
   "author": "Chris Cole",
+  "license": "MIT",
   "version": "1.0.1",
   "keywords": [
     "pebble-app"

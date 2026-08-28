@@ -75,3 +75,7 @@ category, etc.) if updating an existing listing.
 
 Queue time data is provided by [Queue-Times.com](https://queue-times.com/en-US),
 credited in-app per their terms.
+
+## License
+
+[MIT](LICENSE)
