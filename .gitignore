@@ -3,3 +3,4 @@ build/
 *.pbw
 .pebble-venv/
 .lock-waf_*
+screenshots/

@@ -1,7 +1,7 @@
 {
   "name": "energylandia-queues",
   "author": "Chris Cole",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "keywords": [
     "pebble-app"
   ],
@@ -55,7 +55,10 @@
     ],
     "resources": {
       "media": [
-        { "type": "bitmap", "name": "MENU_ICON", "file": "icon.png", "menuIcon": true }
+        { "type": "bitmap", "name": "MENU_ICON", "file": "icon.png", "menuIcon": true },
+        { "type": "font", "name": "RIDE_NAME_FONT_16", "file": "fonts/RobotoCondensed-Bold.ttf",
+          "characterRegex": "[A-Za-z0-9 :.,'’©ąćęłńóśźżĄĆĘŁŃÓŚŹŻ-]",
+          "targetPlatforms": ["basalt", "chalk", "emery", "gabbro"] }
       ]
     }
   },

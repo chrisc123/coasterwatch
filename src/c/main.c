@@ -96,6 +96,15 @@ typedef struct {
   int8_t  vibe_pattern;
 } BandConfig;
 
+#ifdef PBL_COLOR
+// Custom (not system) font: Roboto Condensed at a size tuned to occupy
+// about the same tile width as the old GOTHIC_14_BOLD while standing
+// taller, for legibility on the higher-res color displays. The resource
+// only exists on color platforms (see package.json), so every reference
+// to it — including the RESOURCE_ID itself — must stay inside this guard.
+static GFont s_ride_name_font;
+#endif
+
 static Window      *s_main_window;
 static TextLayer   *s_header_layer;
 static TextLayer   *s_clock_layer;
@@ -157,7 +166,23 @@ static char    s_graph_error_buf[48];
 // now scrolls, this only needs to describe one screenful at a time — the
 // same margins keep whatever row is currently at the visible edge clear of
 // the curve, no matter how far the list has scrolled.
-static int tile_rows(void) { return PBL_IF_ROUND_ELSE(2, 3); }
+// Gabbro (Round 2, 260x260) is a meaningfully bigger screen than Chalk
+// (Time Round, 180x180) — treating both as uniformly "round" via
+// PBL_IF_ROUND_ELSE leaves Gabbro with much larger tiles at the same fixed
+// row count, and text sizes tuned for Chalk's tiles end up looking
+// proportionally tiny. Gabbro gets an extra row instead (3 rows, still 2
+// columns), which lands tile_h close to Chalk's rather than just
+// stretching it, while keeping the same two-wide layout as every other
+// platform.
+static int tile_rows(void) {
+#if defined(PBL_PLATFORM_GABBRO)
+  return 3;
+#else
+  return PBL_IF_ROUND_ELSE(2, 3);
+#endif
+}
+
+static int tile_cols(void) { return TILE_COLS; }
 
 // ---------------------------------------------------------------------------
 // Sort order
@@ -468,6 +493,7 @@ static void format_minute_of_day(int minute_of_day, char *buf, size_t buf_len) {
 typedef struct {
   int w, h; // viewport size (s_scroll_frame's size)
   int pad;
+  int cols;
   int tile_w;
   int tile_h;
   int total_rows;
@@ -479,11 +505,12 @@ static GridMetrics compute_grid_metrics(void) {
   m.w = s_scroll_frame.size.w;
   m.h = s_scroll_frame.size.h;
   m.pad = 4;
+  m.cols = tile_cols();
   int screen_rows = tile_rows();
-  m.tile_w = (m.w - m.pad * (TILE_COLS + 1)) / TILE_COLS;
+  m.tile_w = (m.w - m.pad * (m.cols + 1)) / m.cols;
   m.tile_h = (m.h - m.pad * (screen_rows + 1)) / screen_rows;
 
-  m.total_rows = (s_ride_count + TILE_COLS - 1) / TILE_COLS;
+  m.total_rows = (s_ride_count + m.cols - 1) / m.cols;
   if (m.total_rows < 1) m.total_rows = 1;
   m.content_h = m.pad + m.total_rows * (m.tile_h + m.pad) + ATTRIBUTION_HEIGHT + m.pad;
   if (m.content_h < m.h) m.content_h = m.h;
@@ -492,8 +519,8 @@ static GridMetrics compute_grid_metrics(void) {
 
 // slot is the tile's position in the full (scrollable) list, 0 = first.
 static GRect tile_rect_for_slot(const GridMetrics *m, int slot) {
-  int col = slot % TILE_COLS;
-  int row = slot / TILE_COLS;
+  int col = slot % m->cols;
+  int row = slot / m->cols;
   return GRect(m->pad + col * (m->tile_w + m->pad),
                m->pad + row * (m->tile_h + m->pad),
                m->tile_w, m->tile_h);
@@ -586,7 +613,11 @@ static void grid_update_proc(Layer *layer, GContext *ctx) {
 
   int tile_h = m.tile_h;
   bool show_distance = (tile_h >= 55);
-  GFont name_font = fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD);
+  // s_ride_name_font (custom Roboto Condensed, loaded in init()) is taller
+  // than the old GOTHIC_14_BOLD at about the same tile width, for
+  // legibility on the higher-res color displays (newer hardware). Kept as
+  // Gothic Bold on B/W watches, where that resource doesn't even exist.
+  GFont name_font = PBL_IF_COLOR_ELSE(s_ride_name_font, fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD));
   GFont dist_font = fonts_get_system_font(FONT_KEY_GOTHIC_14);
   GFont wait_font;
   int wait_h;
@@ -1003,7 +1034,24 @@ static void detail_window_load(Window *window) {
   window_set_touch_bridge_disabled(window, true);
 #endif
 
-  s_detail_header_layer = text_layer_create(GRect(0, 0, bounds.size.w, 34));
+  // On round platforms, header/graph/alert-band are all confined to the
+  // largest axis-aligned square inscribed in the circular display, rather
+  // than each independently trying to avoid the bezel — anything drawn
+  // inside that square is guaranteed clear of the curve at every edge, top
+  // and bottom included, which a full-width layout can't promise (a plain
+  // GRect(0, 0, bounds.size.w, ...) header clipped its own text before this
+  // — see the main grid header's near-identical fix). An inscribed square's
+  // diagonal equals the circle's diameter, so side = diameter / sqrt(2).
+#if defined(PBL_ROUND)
+  int diameter = bounds.size.w; // both round platforms are square displays
+  int square_side = (diameter * 707) / 1000; // diameter / sqrt(2)
+  GRect area = GRect((bounds.size.w - square_side) / 2, (bounds.size.h - square_side) / 2,
+                      square_side, square_side);
+#else
+  GRect area = bounds;
+#endif
+
+  s_detail_header_layer = text_layer_create(GRect(area.origin.x, area.origin.y, area.size.w, 34));
   text_layer_set_background_color(s_detail_header_layer, GColorBlack);
   text_layer_set_text_color(s_detail_header_layer, GColorWhite);
   text_layer_set_font(s_detail_header_layer, fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD));
@@ -1011,13 +1059,13 @@ static void detail_window_load(Window *window) {
   layer_add_child(root, text_layer_get_layer(s_detail_header_layer));
   update_detail_header();
 
-  s_detail_graph_layer = layer_create(GRect(0, 34, bounds.size.w,
-                                             bounds.size.h - 34 - ALERT_BAND_HEIGHT));
+  s_detail_graph_layer = layer_create(GRect(area.origin.x, area.origin.y + 34, area.size.w,
+                                             area.size.h - 34 - ALERT_BAND_HEIGHT));
   layer_set_update_proc(s_detail_graph_layer, detail_graph_update_proc);
   layer_add_child(root, s_detail_graph_layer);
 
-  s_detail_alert_layer = layer_create(GRect(0, bounds.size.h - ALERT_BAND_HEIGHT,
-                                             bounds.size.w, ALERT_BAND_HEIGHT));
+  s_detail_alert_layer = layer_create(GRect(area.origin.x, area.origin.y + area.size.h - ALERT_BAND_HEIGHT,
+                                             area.size.w, ALERT_BAND_HEIGHT));
   layer_set_update_proc(s_detail_alert_layer, detail_alert_update_proc);
   layer_add_child(root, s_detail_alert_layer);
 }
@@ -1191,9 +1239,17 @@ static void main_window_load(Window *window) {
   // A full-width black bar clips oddly at the very top of a round bezel, so
   // round platforms get a plain label instead of a banner — and skip the
   // separate clock layer entirely (see update_clock()'s comment).
+  //
+  // The header itself is also shifted down from y=0: right at the top of a
+  // round display, the visible chord is much narrower than the full screen
+  // width (the bezel obscures the corners — see
+  // developer.repebble.com/guides/user-interfaces/round-app-ui/), so a
+  // full-width, y=0 header clips its own text. Confirmed on-device/emulator
+  // (chalk): the clock read ".s:25" instead of "23:25" before this offset.
 #if defined(PBL_ROUND)
+  static const int ROUND_HEADER_Y_OFFSET = 14;
   s_clock_layer = NULL;
-  s_header_layer = text_layer_create(GRect(0, 0, bounds.size.w, HEADER_HEIGHT));
+  s_header_layer = text_layer_create(GRect(0, ROUND_HEADER_Y_OFFSET, bounds.size.w, HEADER_HEIGHT));
   text_layer_set_background_color(s_header_layer, GColorClear);
   text_layer_set_text_color(s_header_layer, GColorBlack);
 #else
@@ -1286,6 +1342,10 @@ static void init(void) {
   load_alerts();
   load_band_config();
 
+#ifdef PBL_COLOR
+  s_ride_name_font = fonts_load_custom_font(resource_get_handle(RESOURCE_ID_RIDE_NAME_FONT_16));
+#endif
+
 #if PBL_API_EXISTS(app_touch_navigation_enable)
   // Third-party apps are opt-out of touch by default; without this call it's
   // unclear from the SDK docs whether even our own recognizers receive
@@ -1324,6 +1384,9 @@ static void init(void) {
 static void deinit(void) {
   if (s_refresh_timer) app_timer_cancel(s_refresh_timer);
   window_destroy(s_main_window);
+#ifdef PBL_COLOR
+  fonts_unload_custom_font(s_ride_name_font);
+#endif
 }
 
 int main(void) {
