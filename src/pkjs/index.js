@@ -230,11 +230,19 @@ var THORPE_ROSTER = [
   ]}
 ];
 
+// timezone: the park's IANA zone, from queue-times.com/parks.json (used to
+// work out the park's own "today" for the schedule lookup below).
+// themeParksId: the destination's UUID on themeparks.wiki, from
+// /v1/destinations — a live per-day open/close schedule, unlike coordinates
+// above, so unlike ENERGYLANDIA_COORDS/THORPE_COORDS this one genuinely is a
+// runtime dependency (see "Park operating hours" below for why).
 var PARKS = {
   317: { name: 'Energylandia', roster: ENERGYLANDIA_ROSTER,
-         coords: ENERGYLANDIA_COORDS, defaultVisible: ENERGYLANDIA_DEFAULT_VISIBLE },
+         coords: ENERGYLANDIA_COORDS, defaultVisible: ENERGYLANDIA_DEFAULT_VISIBLE,
+         timezone: 'Europe/Warsaw', themeParksId: 'd13baede-ab6d-419e-930a-ce7029a092e5' },
   2:   { name: 'Thorpe Park', roster: THORPE_ROSTER,
-         coords: THORPE_COORDS, defaultVisible: THORPE_DEFAULT_VISIBLE }
+         coords: THORPE_COORDS, defaultVisible: THORPE_DEFAULT_VISIBLE,
+         timezone: 'Europe/London', themeParksId: 'b08d9272-d070-4580-9fcd-375270b191a7' }
 };
 
 function getSelectedParkId() {
@@ -506,10 +514,118 @@ function sendGraph(rideId) {
 }
 
 // ---------------------------------------------------------------------------
+// Park operating hours
+//
+// queue-times.com's own `is_open` flag is unreliable for at least
+// Energylandia: rides keep reporting is_open=true with wait_time=0 well
+// outside opening hours, rather than actually going closed. queue-times.com
+// itself has no schedule endpoint (parks.json exposes each park's IANA
+// timezone but not its hours), so this cross-checks against themeparks.wiki's
+// live per-day schedule instead and overrides is_open to false for every
+// ride when the park itself isn't open right now.
+//
+// Cached per park for the day so this doesn't add a network round-trip to
+// every 5-minute refresh — only the first fetch after a (device-local, see
+// below) date rollover re-fetches. The cache key uses the phone's own local
+// date rather than the park's, purely as a "when to bother re-fetching"
+// heuristic; it doesn't affect correctness of the open/closed *result*,
+// which always compares the live-fetched openingTime/closingTime instants
+// against the current time. The only place the two dates can disagree is a
+// short window either side of the park's own local midnight, and a park is
+// essentially always closed then under both the stale and fresh schedule
+// anyway, so a slightly-late refetch there is harmless.
+var SCHEDULE_KEY = 'parkSchedule_v1';
+
+function loadCachedSchedule(parkId) {
+  try {
+    var all = JSON.parse(localStorage.getItem(SCHEDULE_KEY)) || {};
+    return all[parkId] || null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function saveCachedSchedule(parkId, entry) {
+  var all = {};
+  try { all = JSON.parse(localStorage.getItem(SCHEDULE_KEY)) || {}; } catch (e) { /* ignore */ }
+  all[parkId] = entry;
+  try { localStorage.setItem(SCHEDULE_KEY, JSON.stringify(all)); } catch (e) {
+    console.log('CoasterWatch: failed to save park schedule: ' + e);
+  }
+}
+
+// The park's own "today" (en-CA formats as YYYY-MM-DD, matching the
+// schedule API's `date` field) - falls back to null if Intl/timeZone
+// support is missing, in which case the caller just uses schedule[0].
+function todayInTimezone(tz) {
+  try {
+    return new Intl.DateTimeFormat('en-CA', { timeZone: tz }).format(new Date());
+  } catch (e) {
+    return null;
+  }
+}
+
+// callback(scheduleEntry|null). null means "couldn't determine" — callers
+// should treat that as "don't override", i.e. trust queue-times.com's own
+// is_open as before, rather than guessing the park closed.
+function fetchParkSchedule(park, callback) {
+  var parkId = getSelectedParkId();
+  var cached = loadCachedSchedule(parkId);
+  if (cached && cached.fetchedDate === todayStr()) {
+    callback(cached);
+    return;
+  }
+  if (!park.themeParksId) {
+    callback(null);
+    return;
+  }
+  var url = 'https://api.themeparks.wiki/v1/entity/' + park.themeParksId + '/schedule';
+  xhrRequest(url, 'GET', function (responseText) {
+    try {
+      var data = JSON.parse(responseText);
+      var list = data.schedule || [];
+      var todayLocal = todayInTimezone(park.timezone);
+      var todayEntry = null;
+      for (var i = 0; i < list.length; i++) {
+        if (list[i].date === todayLocal) { todayEntry = list[i]; break; }
+      }
+      if (!todayEntry) todayEntry = list[0] || null;
+      var entry = todayEntry ? {
+        fetchedDate: todayStr(),
+        type: todayEntry.type,
+        openingTime: todayEntry.openingTime,
+        closingTime: todayEntry.closingTime
+      } : null;
+      saveCachedSchedule(parkId, entry);
+      callback(entry);
+    } catch (e) {
+      console.log('CoasterWatch: failed to parse park schedule: ' + e);
+      callback(null);
+    }
+  }, function (errMsg) {
+    console.log('CoasterWatch: park schedule fetch failed: ' + errMsg);
+    callback(null); // network failure: degrade to trusting queue-times.com's own flags
+  });
+}
+
+// true unless we positively know the park is closed right now - "unknown"
+// (schedule null/unparseable) fails open rather than mislabeling every ride.
+function isParkOpenNow(schedule) {
+  if (!schedule) return true;
+  if (schedule.type !== 'OPERATING') return false;
+  var open = Date.parse(schedule.openingTime);
+  var close = Date.parse(schedule.closingTime);
+  if (isNaN(open) || isNaN(close)) return true;
+  var now = Date.now();
+  return now >= open && now <= close;
+}
+
+// ---------------------------------------------------------------------------
 // Main fetch cycle
 
 function fetchQueueTimes() {
   var apiUrl = 'https://queue-times.com/parks/' + getSelectedParkId() + '/queue_times.json';
+  var park = getActivePark();
   getLocation(function (loc) {
     xhrRequest(apiUrl, 'GET', function (responseText) {
       try {
@@ -519,18 +635,24 @@ function fetchQueueTimes() {
           sendError('No ride data available');
           return;
         }
-        // Record every ride (not just visible ones) so hiding/unhiding a
-        // ride later doesn't lose history collected while it was hidden.
-        appendHistory(rides);
+        fetchParkSchedule(park, function (schedule) {
+          if (!isParkOpenNow(schedule)) {
+            for (var i = 0; i < rides.length; i++) rides[i].is_open = false;
+          }
 
-        var visible = getVisibleIdSet();
-        var filtered = rides.filter(function (r) { return visible.has(r.id); });
-        if (filtered.length === 0) {
-          sendError('No rides selected - check settings');
-          return;
-        }
-        attachDistances(filtered, loc);
-        sendRidesToWatch(filtered);
+          // Record every ride (not just visible ones) so hiding/unhiding a
+          // ride later doesn't lose history collected while it was hidden.
+          appendHistory(rides);
+
+          var visible = getVisibleIdSet();
+          var filtered = rides.filter(function (r) { return visible.has(r.id); });
+          if (filtered.length === 0) {
+            sendError('No rides selected - check settings');
+            return;
+          }
+          attachDistances(filtered, loc);
+          sendRidesToWatch(filtered);
+        });
       } catch (e) {
         sendError('Bad response from server');
       }
