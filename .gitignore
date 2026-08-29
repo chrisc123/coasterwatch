@@ -4,3 +4,12 @@ build/
 .pebble-venv/
 .lock-waf_*
 screenshots/
+
+# Local AI coding-agent context (AGENTS.md is the canonical one; CLAUDE.md and
+# GEMINI.md just point at it). Deliberately untracked: local working notes,
+# not project documentation for contributors — that's README.md.
+AGENTS.md
+CLAUDE.md
+GEMINI.md
+.agents/
+.gemini/
