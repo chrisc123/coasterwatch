@@ -38,11 +38,10 @@
 
 #define MAX_RIDES         40
 #define MAX_GRAPH_POINTS  24
-// Graph x-axis is pegged to a fixed 08:00 start rather than the earliest
-// recorded sample: none of the supported parks open before this, and the
-// closed-park detection now means samples get recorded well before opening
-// too (see fetchParkSchedule() in pkjs), which used to drag the axis's start
-// backwards into a long flat "closed" tail instead of showing the day.
+// Fallback graph x-axis start (08:00) for when the phone hasn't sent a
+// per-park peg yet (see s_graph_peg_minute) - the real peg is "30 min
+// before this park's opening time", computed phone-side since that's where
+// the park's actual schedule/timezone is known.
 #define GRAPH_START_MINUTE (8 * 60)
 #define TILE_COLS         2
 #define NAME_BUF_LEN      24
@@ -162,6 +161,13 @@ static int     s_graph_count       = 0;
 static bool    s_graph_loading     = true;
 static bool    s_graph_show_error  = false;
 static char    s_graph_error_buf[48];
+// -1 = not received yet (phone hasn't fetched a park schedule this session);
+// falls back to GRAPH_START_MINUTE below. Otherwise the phone's own
+// pre-computed "30 min before this park's opening time, converted to the
+// phone's local wall clock" - see graphPegMinuteOfDay() in pkjs, which is
+// where the actual park/phone timezone handling happens (the watch just
+// plots whatever minute-of-day it's told, same as every other graph point).
+static int16_t s_graph_peg_minute = -1;
 
 // ---------------------------------------------------------------------------
 // Layout helpers
@@ -838,20 +844,23 @@ static void detail_graph_update_proc(Layer *layer, GContext *ctx) {
   GRect area = GRect(bounds.origin.x + margin + 26, bounds.origin.y + margin,
                       bounds.size.w - 2 * margin - 26, bounds.size.h - 2 * margin - 14);
 
-  // x-axis is pegged to a fixed 08:00 start (see GRAPH_START_MINUTE) rather
-  // than whichever minute the earliest recorded sample happens to land on,
-  // so the graph reads the same shape day to day instead of its start
-  // drifting with whenever the phone first fetched today. Falls back to the
-  // old dynamic start if there isn't yet 2+ samples at/after 08:00 (e.g.
-  // checking before any park could plausibly be open) so the graph isn't
-  // left empty.
+  // x-axis is pegged to 30 minutes before the park's own opening time
+  // (s_graph_peg_minute, already converted to the phone's local wall clock —
+  // see graphPegMinuteOfDay() in pkjs) rather than whichever minute the
+  // earliest recorded sample happens to land on, so the graph reads the same
+  // shape day to day instead of its start drifting with whenever the phone
+  // first fetched today. Falls back to a fixed 08:00 if the phone hasn't
+  // sent a peg yet, and further falls back to the old dynamic start if there
+  // isn't yet 2+ samples at/after the peg (e.g. checking before the park
+  // could plausibly be open) so the graph isn't left empty.
+  int peg_minute = (s_graph_peg_minute >= 0) ? s_graph_peg_minute : GRAPH_START_MINUTE;
   int start_idx = s_graph_count;
   for (int i = 0; i < s_graph_count; i++) {
-    if (s_graph_minute_of_day[i] >= GRAPH_START_MINUTE) { start_idx = i; break; }
+    if (s_graph_minute_of_day[i] >= peg_minute) { start_idx = i; break; }
   }
   bool pegged = (start_idx < s_graph_count) && (s_graph_count - start_idx >= 2);
   if (!pegged) start_idx = 0;
-  int graph_start = pegged ? GRAPH_START_MINUTE : s_graph_minute_of_day[start_idx];
+  int graph_start = pegged ? peg_minute : s_graph_minute_of_day[start_idx];
   int graph_end = s_graph_minute_of_day[s_graph_count - 1];
   if (graph_end <= graph_start) graph_end = graph_start + 1; // guard against a zero/negative span
 
@@ -1127,6 +1136,7 @@ static void open_detail_window(void) {
   s_graph_count = 0;
   s_graph_loading = true;
   s_graph_show_error = false;
+  s_graph_peg_minute = -1;
 
   s_detail_window = window_create();
   window_set_background_color(s_detail_window, GColorWhite);
@@ -1197,6 +1207,8 @@ static void inbox_received_callback(DictionaryIterator *iter, void *context) {
     s_graph_count = 0;
     s_graph_loading = true;
     s_graph_show_error = false;
+    Tuple *t_gpeg = dict_find(iter, MESSAGE_KEY_GraphPegMinuteOfDay);
+    s_graph_peg_minute = t_gpeg ? (int16_t)t_gpeg->value->int32 : -1;
     if (s_detail_graph_layer) layer_mark_dirty(s_detail_graph_layer);
     return;
   }

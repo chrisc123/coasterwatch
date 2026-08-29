@@ -506,7 +506,10 @@ function sendGraph(rideId) {
     Pebble.sendAppMessage({ 'GraphError': 'Not enough data recorded yet today' });
     return;
   }
-  Pebble.sendAppMessage({ 'GraphCount': points.length }, function () {
+  var dict = { 'GraphCount': points.length };
+  var peg = graphPegMinuteOfDay();
+  if (peg !== null) dict['GraphPegMinuteOfDay'] = peg;
+  Pebble.sendAppMessage(dict, function () {
     sendGraphPoint(0, points);
   }, function () {
     console.log('CoasterWatch: failed to send GraphCount');
@@ -618,6 +621,24 @@ function isParkOpenNow(schedule) {
   if (isNaN(open) || isNaN(close)) return true;
   var now = Date.now();
   return now >= open && now <= close;
+}
+
+// Minute-of-day (0-1439), in the *phone's* local time, 30 minutes before
+// the park's own opening time - null if no cached schedule is available yet.
+// The 30-minute cushion and the actual conversion both matter here: the park
+// and the phone/watch can be in different timezones (e.g. a UK watch
+// tracking a Polish park), so this converts openingTime's absolute instant
+// through the phone's own Date methods (always local by JS spec) rather
+// than assuming the park's clock-face hour means anything on the watch -
+// same reasoning as isParkOpenNow, just producing a wall-clock minute
+// instead of a yes/no.
+function graphPegMinuteOfDay() {
+  var schedule = loadCachedSchedule(getSelectedParkId());
+  if (!schedule || !schedule.openingTime) return null;
+  var openMs = Date.parse(schedule.openingTime);
+  if (isNaN(openMs)) return null;
+  var peg = new Date(openMs - 30 * 60 * 1000);
+  return ((peg.getHours() * 60 + peg.getMinutes()) % 1440 + 1440) % 1440;
 }
 
 // ---------------------------------------------------------------------------
