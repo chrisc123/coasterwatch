@@ -643,24 +643,6 @@ static void draw_vcentered_text(GContext *ctx, const char *msg, GFont font, GRec
   graphics_draw_text(ctx, msg, font, text_rect, overflow_mode, GTextAlignmentCenter, NULL);
 }
 
-// draw_vcentered_text centers the *measured line box* (content.h, from the
-// font's normal ascent+descent metrics), which is correct for ordinary
-// text but not for a short symbol glyph with no descender ("-", "+"): its
-// visible ink sits in the upper part of that box, so box-centering still
-// leaves it looking too high. Confirmed by logging the actual numbers for
-// GOTHIC_24_BOLD's "-"/"+": bounds.h=36, content.h=24, centered y=10 (6px
-// margin above and below the box) - correct as a box, visibly off as a
-// glyph. Nudges down a few px to compensate; empirically tuned against
-// that specific font/size, not derived from font metrics (Pebble's API
-// doesn't expose ascent/descent separately from full line height).
-static void draw_vcentered_symbol(GContext *ctx, const char *msg, GFont font, GRect bounds) {
-  GSize content = graphics_text_layout_get_content_size(msg, font, bounds,
-                                                         GTextOverflowModeFill, GTextAlignmentCenter);
-  int y = bounds.origin.y + (bounds.size.h - content.h) / 2 + 4;
-  GRect text_rect = GRect(bounds.origin.x, y, bounds.size.w, content.h);
-  graphics_draw_text(ctx, msg, font, text_rect, GTextOverflowModeFill, GTextAlignmentCenter, NULL);
-}
-
 static void grid_update_proc(Layer *layer, GContext *ctx) {
   GridMetrics m = compute_grid_metrics();
 
@@ -1013,8 +995,8 @@ static void detail_alert_update_proc(Layer *layer, GContext *ctx) {
   graphics_draw_round_rect(ctx, plus_rect, 4);
   GFont sym_font = fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD);
   graphics_context_set_text_color(ctx, band_text);
-  draw_vcentered_symbol(ctx, "-", sym_font, minus_rect);
-  draw_vcentered_symbol(ctx, "+", sym_font, plus_rect);
+  graphics_draw_text(ctx, "-", sym_font, minus_rect, GTextOverflowModeFill, GTextAlignmentCenter, NULL);
+  graphics_draw_text(ctx, "+", sym_font, plus_rect, GTextOverflowModeFill, GTextAlignmentCenter, NULL);
 
   char buf[28];
   if (a && a->enabled) {
@@ -1024,12 +1006,8 @@ static void detail_alert_update_proc(Layer *layer, GContext *ctx) {
   }
   GRect label_rect = GRect(minus_rect.origin.x + minus_rect.size.w, 4,
                             plus_rect.origin.x - (minus_rect.origin.x + minus_rect.size.w), bounds.size.h - 8);
-  // Unlike the header above (full tile/window width), this label is
-  // squeezed between two fixed-width buttons - on the narrower round
-  // platforms (chalk especially) the wider custom font clipped "Alert ON:
-  // <Nm" onto a cut-off second line instead of fitting. Sticking with the
-  // system font here, where there's reliably enough width margin to matter.
-  draw_vcentered_text(ctx, buf, fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD), label_rect, GTextOverflowModeFill);
+  graphics_draw_text(ctx, buf, fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD), label_rect,
+                      GTextOverflowModeFill, GTextAlignmentCenter, NULL);
 }
 
 static void toggle_alert_for_current_ride(void) {
