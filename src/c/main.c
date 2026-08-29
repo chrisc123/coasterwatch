@@ -126,10 +126,11 @@ static GRect        s_scroll_frame; // the scroll layer's frame, in window/root-
 static int16_t      s_pan_base;     // committed scroll offset.y during a drag
 #endif
 
-static Window    *s_detail_window;
-static TextLayer *s_detail_header_layer;
-static Layer     *s_detail_graph_layer;
-static Layer     *s_detail_alert_layer;
+static Window *s_detail_window;
+static Layer  *s_detail_header_layer;
+static Layer  *s_detail_graph_layer;
+static Layer  *s_detail_alert_layer;
+static char    s_detail_header_buf[40];
 
 static AlertConfig s_alerts[MAX_ALERTS];
 
@@ -838,13 +839,21 @@ static void main_pan_handler(const Recognizer *recognizer, RecognizerEvent event
 // Detail window: per-ride graph
 
 static void update_detail_header(void) {
-  static char buf[40];
   if (s_detail_wait < 0) {
-    snprintf(buf, sizeof(buf), "%s: Closed", s_detail_name);
+    snprintf(s_detail_header_buf, sizeof(s_detail_header_buf), "%s: Closed", s_detail_name);
   } else {
-    snprintf(buf, sizeof(buf), "%s: %dm", s_detail_name, s_detail_wait);
+    snprintf(s_detail_header_buf, sizeof(s_detail_header_buf), "%s: %dm", s_detail_name, s_detail_wait);
   }
-  text_layer_set_text(s_detail_header_layer, buf);
+  if (s_detail_header_layer) layer_mark_dirty(s_detail_header_layer);
+}
+
+static void detail_header_update_proc(Layer *layer, GContext *ctx) {
+  GRect bounds = layer_get_bounds(layer);
+  graphics_context_set_fill_color(ctx, GColorBlack);
+  graphics_fill_rect(ctx, bounds, 0, GCornerNone);
+  graphics_context_set_text_color(ctx, GColorWhite);
+  GFont font = PBL_IF_COLOR_ELSE(s_ride_name_font, fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD));
+  draw_vcentered_text(ctx, s_detail_header_buf, font, bounds, GTextOverflowModeFill);
 }
 
 static void detail_graph_update_proc(Layer *layer, GContext *ctx) {
@@ -986,8 +995,8 @@ static void detail_alert_update_proc(Layer *layer, GContext *ctx) {
   graphics_draw_round_rect(ctx, plus_rect, 4);
   GFont sym_font = fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD);
   graphics_context_set_text_color(ctx, band_text);
-  graphics_draw_text(ctx, "-", sym_font, minus_rect, GTextOverflowModeFill, GTextAlignmentCenter, NULL);
-  graphics_draw_text(ctx, "+", sym_font, plus_rect, GTextOverflowModeFill, GTextAlignmentCenter, NULL);
+  draw_vcentered_text(ctx, "-", sym_font, minus_rect, GTextOverflowModeFill);
+  draw_vcentered_text(ctx, "+", sym_font, plus_rect, GTextOverflowModeFill);
 
   char buf[28];
   if (a && a->enabled) {
@@ -997,8 +1006,12 @@ static void detail_alert_update_proc(Layer *layer, GContext *ctx) {
   }
   GRect label_rect = GRect(minus_rect.origin.x + minus_rect.size.w, 4,
                             plus_rect.origin.x - (minus_rect.origin.x + minus_rect.size.w), bounds.size.h - 8);
-  graphics_draw_text(ctx, buf, fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD), label_rect,
-                      GTextOverflowModeFill, GTextAlignmentCenter, NULL);
+  // Unlike the header above (full tile/window width), this label is
+  // squeezed between two fixed-width buttons - on the narrower round
+  // platforms (chalk especially) the wider custom font clipped "Alert ON:
+  // <Nm" onto a cut-off second line instead of fitting. Sticking with the
+  // system font here, where there's reliably enough width margin to matter.
+  draw_vcentered_text(ctx, buf, fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD), label_rect, GTextOverflowModeFill);
 }
 
 static void toggle_alert_for_current_ride(void) {
@@ -1109,12 +1122,9 @@ static void detail_window_load(Window *window) {
   GRect area = bounds;
 #endif
 
-  s_detail_header_layer = text_layer_create(GRect(area.origin.x, area.origin.y, area.size.w, 34));
-  text_layer_set_background_color(s_detail_header_layer, GColorBlack);
-  text_layer_set_text_color(s_detail_header_layer, GColorWhite);
-  text_layer_set_font(s_detail_header_layer, fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD));
-  text_layer_set_text_alignment(s_detail_header_layer, GTextAlignmentCenter);
-  layer_add_child(root, text_layer_get_layer(s_detail_header_layer));
+  s_detail_header_layer = layer_create(GRect(area.origin.x, area.origin.y, area.size.w, 34));
+  layer_set_update_proc(s_detail_header_layer, detail_header_update_proc);
+  layer_add_child(root, s_detail_header_layer);
   update_detail_header();
 
   s_detail_graph_layer = layer_create(GRect(area.origin.x, area.origin.y + 34, area.size.w,
@@ -1133,7 +1143,7 @@ static void detail_window_unload(Window *window) {
   s_detail_alert_layer = NULL;
   layer_destroy(s_detail_graph_layer);
   s_detail_graph_layer = NULL;
-  text_layer_destroy(s_detail_header_layer);
+  layer_destroy(s_detail_header_layer);
   s_detail_header_layer = NULL;
   window_destroy(window);
   s_detail_window = NULL;
