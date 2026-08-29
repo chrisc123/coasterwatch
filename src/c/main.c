@@ -624,15 +624,32 @@ static void draw_bell_icon(GContext *ctx, GPoint top, GColor color) {
   graphics_fill_circle(ctx, GPoint(top.x + 4, top.y + 10), 1);
 }
 
+// graphics_draw_text always top-anchors within the given rect. That's fine
+// when the rect is already sized tightly to its content, but wherever a
+// rect is deliberately taller than one line so a short string still has
+// room to wrap onto a second line (grid tile names, graph status messages),
+// a short one just ends up stranded near the top with a dead gap below it —
+// worse the larger the rect, which is exactly what happens on the bigger
+// color platforms (emery/gabbro). Centers vertically instead, by measuring
+// the text's own rendered height first and offsetting the draw rect to
+// match; still wraps/truncates exactly as the given overflow mode says.
+static void draw_vcentered_text(GContext *ctx, const char *msg, GFont font, GRect bounds,
+                                 GTextOverflowMode overflow_mode) {
+  GSize content = graphics_text_layout_get_content_size(msg, font, bounds, overflow_mode, GTextAlignmentCenter);
+  int y = bounds.origin.y + (bounds.size.h - content.h) / 2;
+  if (y < bounds.origin.y) y = bounds.origin.y;
+  GRect text_rect = GRect(bounds.origin.x, y, bounds.size.w, content.h);
+  graphics_draw_text(ctx, msg, font, text_rect, overflow_mode, GTextAlignmentCenter, NULL);
+}
+
 static void grid_update_proc(Layer *layer, GContext *ctx) {
   GridMetrics m = compute_grid_metrics();
 
   if (s_show_error || s_ride_count == 0) {
     const char *msg = s_show_error ? s_error_buf : "Loading queue times...";
     graphics_context_set_text_color(ctx, GColorBlack);
-    graphics_draw_text(ctx, msg, fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD),
-                        GRect(0, 0, m.w, m.h),
-                        GTextOverflowModeWordWrap, GTextAlignmentCenter, NULL);
+    draw_vcentered_text(ctx, msg, fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD), GRect(0, 0, m.w, m.h),
+                         GTextOverflowModeWordWrap);
     return;
   }
 
@@ -688,8 +705,11 @@ static void grid_update_proc(Layer *layer, GContext *ctx) {
     graphics_context_set_text_color(ctx, text_color);
     GRect name_rect = GRect(tile.origin.x + 2, tile.origin.y + 1,
                              tile.size.w - 4, tile.size.h - wait_h - dist_h - 2);
-    graphics_draw_text(ctx, r->name, name_font, name_rect,
-                        GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
+    // name_rect is deliberately taller than one line (room to wrap a long
+    // name), which left a short one sitting at its top with a dead gap
+    // above the wait number below it - more noticeable the bigger the tile,
+    // i.e. worst on exactly the platforms (emery/gabbro) this is aimed at.
+    draw_vcentered_text(ctx, r->name, name_font, name_rect, GTextOverflowModeTrailingEllipsis);
 
     char wait_buf[8];
     if (r->wait_minutes < 0) {
@@ -833,16 +853,15 @@ static void detail_graph_update_proc(Layer *layer, GContext *ctx) {
   if (s_graph_show_error || s_graph_loading) {
     const char *msg = s_graph_show_error ? s_graph_error_buf : "Loading graph...";
     graphics_context_set_text_color(ctx, GColorBlack);
-    graphics_draw_text(ctx, msg, fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD),
-                        bounds, GTextOverflowModeWordWrap, GTextAlignmentCenter, NULL);
+    draw_vcentered_text(ctx, msg, fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD), bounds,
+                         GTextOverflowModeWordWrap);
     return;
   }
 
   if (s_graph_count < 2) {
     graphics_context_set_text_color(ctx, GColorBlack);
-    graphics_draw_text(ctx, "Not enough data\nrecorded yet today",
-                        fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD),
-                        bounds, GTextOverflowModeWordWrap, GTextAlignmentCenter, NULL);
+    draw_vcentered_text(ctx, "Not enough data\nrecorded yet today",
+                         fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD), bounds, GTextOverflowModeWordWrap);
     return;
   }
 
