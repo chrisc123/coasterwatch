@@ -158,6 +158,14 @@ static int16_t s_detail_wait = -1;
 static int16_t s_graph_points[MAX_GRAPH_POINTS];
 static int16_t s_graph_minute_of_day[MAX_GRAPH_POINTS]; // 0-1439, actual clock time
 static int     s_graph_count       = 0;
+// How many points GraphCount said to expect; 0 = no GraphCount received yet
+// this window. s_graph_loading stays true until s_graph_count reaches this,
+// so the graph only ever renders once with the complete, final-scaled
+// dataset — rendering after each point as it streamed in (the old
+// behavior) visibly jumped the y-axis scale around as later, non-closed
+// samples raised the max above whatever the early (often zero/closed)
+// samples had implied.
+static int     s_graph_expected_count = 0;
 static bool    s_graph_loading     = true;
 static bool    s_graph_show_error  = false;
 static char    s_graph_error_buf[48];
@@ -824,7 +832,7 @@ static void update_detail_header(void) {
 static void detail_graph_update_proc(Layer *layer, GContext *ctx) {
   GRect bounds = layer_get_bounds(layer);
 
-  if (s_graph_show_error || (s_graph_loading && s_graph_count == 0)) {
+  if (s_graph_show_error || s_graph_loading) {
     const char *msg = s_graph_show_error ? s_graph_error_buf : "Loading graph...";
     graphics_context_set_text_color(ctx, GColorBlack);
     graphics_draw_text(ctx, msg, fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD),
@@ -1134,6 +1142,7 @@ static void open_detail_window(void) {
   s_detail_name[NAME_BUF_LEN - 1] = '\0';
   s_detail_wait = r->wait_minutes;
   s_graph_count = 0;
+  s_graph_expected_count = 0;
   s_graph_loading = true;
   s_graph_show_error = false;
   s_graph_peg_minute = -1;
@@ -1205,6 +1214,7 @@ static void inbox_received_callback(DictionaryIterator *iter, void *context) {
   Tuple *t_gcount = dict_find(iter, MESSAGE_KEY_GraphCount);
   if (t_gcount) {
     s_graph_count = 0;
+    s_graph_expected_count = t_gcount->value->int32;
     s_graph_loading = true;
     s_graph_show_error = false;
     Tuple *t_gpeg = dict_find(iter, MESSAGE_KEY_GraphPegMinuteOfDay);
@@ -1230,8 +1240,13 @@ static void inbox_received_callback(DictionaryIterator *iter, void *context) {
       s_graph_points[gi] = (int16_t)t_gw->value->int32;
       s_graph_minute_of_day[gi] = (int16_t)t_gm->value->int32;
       s_graph_count = gi + 1;
-      s_graph_loading = false;
-      if (s_detail_graph_layer) layer_mark_dirty(s_detail_graph_layer);
+      // Stay in "loading" (and skip the redraw) until every expected point
+      // has arrived, so the graph renders exactly once with its final
+      // scale/shape rather than visibly rescaling itself point by point.
+      if (s_graph_expected_count > 0 && s_graph_count >= s_graph_expected_count) {
+        s_graph_loading = false;
+        if (s_detail_graph_layer) layer_mark_dirty(s_detail_graph_layer);
+      }
     }
     return;
   }
