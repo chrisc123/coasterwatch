@@ -44,11 +44,10 @@
 // line is skipped (see detail_graph_update_proc) - well above the normal
 // ~5-15 min refresh cadence (REFRESH_INTERVAL_MS below, further stretched
 // on low battery), so it only fires on a real gap (app closed/backgrounded
-// a while, watch put away), not just a slow refresh tick. Keep in sync with
-// GRAPH_SESSION_GAP_MINUTES in pkjs/index.js — that's what decides which
-// points get compressed to 2-point markers in the first place; a mismatch
-// wouldn't break anything, just make a compressed marker pair not visually
-// read as a gap here, or vice versa.
+// a while, watch put away), not just a slow refresh tick. Purely a visual
+// cue that two neighbouring points aren't contiguous in time: pkjs sends
+// the whole recorded day and no longer treats gaps specially at all, so
+// this value is local to the drawing here and nothing else depends on it.
 #define GRAPH_GAP_MINUTES 60
 #define TILE_COLS         2
 // Grid margin: gap from the screen edge to the outermost tile, and between

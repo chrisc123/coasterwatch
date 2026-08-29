@@ -428,25 +428,6 @@ function appendHistory(rides) {
   saveHistory(hist);
 }
 
-// Minutes between consecutive samples beyond which they're treated as
-// separate sessions - well above the normal ~5-15 min refresh cadence
-// (REFRESH_INTERVAL_MS in main.c, further stretched on low battery), so it
-// only fires on a real gap (app closed/backgrounded a while, watch put
-// away), not just a slow refresh tick. Keep in sync with GRAPH_GAP_MINUTES
-// in main.c — that's what decides whether the watch draws a connecting
-// line into a point, purely visually; a mismatch wouldn't break anything,
-// just make a compressed marker pair not visually read as a gap there, or
-// vice versa.
-var GRAPH_SESSION_GAP_MINUTES = 60;
-
-// How many points an *older* (not-current) session is allowed to keep -
-// just enough for its shape to register (first/last point) as a hint of
-// what it looked like, without competing with the current session for the
-// limited MAX_GRAPH_POINTS budget. A short, disconnected earlier session
-// (e.g. testing the app hours before the park opened) would otherwise
-// crowd out resolution for the data that's actually relevant right now.
-var GRAPH_OLD_SESSION_MAX_POINTS = 2;
-
 // Minute-of-day (phone-local), 60 minutes before the active park's cached
 // opening time - null if no cached schedule is available yet. Some parks
 // let guests in a little before the official opening time, hence the hour
@@ -475,17 +456,6 @@ function downsample(arr, maxPoints) {
   return out;
 }
 
-// Splits `arr` (oldest-first [minute, wait] pairs) wherever consecutive
-// samples are more than GRAPH_SESSION_GAP_MINUTES apart.
-function splitIntoSessions(arr) {
-  var sessions = [[arr[0]]];
-  for (var i = 1; i < arr.length; i++) {
-    if (arr[i][0] - arr[i - 1][0] > GRAPH_SESSION_GAP_MINUTES) sessions.push([]);
-    sessions[sessions.length - 1].push(arr[i]);
-  }
-  return sessions;
-}
-
 // Returns [{wait, minuteOfDay}, ...] oldest-first, or null if fewer than 2
 // samples exist today. minuteOfDay is the sample's actual clock time
 // (0-1439), sent along purely for the watch's axis-endpoint labels and to
@@ -494,13 +464,21 @@ function splitIntoSessions(arr) {
 // doesn't stretch the axis to cover a long dead stretch and squeeze
 // everything else into a sliver. Samples from before the park could
 // plausibly have been open (see graphFloorMinuteOfDay) are dropped
-// entirely, not just compressed — there's no legitimate reading to hint at
-// from before the park opened. Any remaining *older* session (see
-// splitIntoSessions) is compressed down to GRAPH_OLD_SESSION_MAX_POINTS
-// instead, for a real same-day gap (e.g. Bluetooth dropped for a while);
-// only the current session competes for the remaining MAX_GRAPH_POINTS
-// budget. History never spans midnight since it resets daily, so there's
-// no wraparound to account for.
+// entirely — there's no legitimate reading from before the park opened.
+// Everything after that is the real recorded day and is kept, thinned
+// evenly across the whole span to fit MAX_GRAPH_POINTS.
+//
+// Deliberately does NOT special-case gaps any more. An earlier attempt
+// split the day at >60min gaps and compressed every "older" session to a
+// couple of marker points, on the assumption such a session was stray
+// junk. That's wrong for how the app is actually used: a Pebble watchapp
+// only records while it's the running app, so a normal day of real use is
+// naturally many bursts separated by long gaps — and compressing them
+// threw away most of the day's genuine queue history (a 2.5-hour block of
+// real samples collapsing to 2 points). Gaps cost no horizontal space
+// under index-based spacing anyway, and the pre-opening floor above
+// already removes the junk that motivated the split; the watch still
+// marks a gap by skipping the connecting line (GRAPH_GAP_MINUTES).
 function getGraphPoints(rideId) {
   var hist = loadHistory();
   var arr = hist.rides[rideId];
@@ -512,30 +490,7 @@ function getGraphPoints(rideId) {
     if (arr.length < 2) return null;
   }
 
-  var sessions = splitIntoSessions(arr);
-  var current = sessions[sessions.length - 1];
-  var older = sessions.slice(0, -1);
-
-  var oldMarkers = [];
-  for (var s = 0; s < older.length; s++) {
-    oldMarkers = oldMarkers.concat(downsample(older[s], GRAPH_OLD_SESSION_MAX_POINTS));
-  }
-  // With enough older sessions (each already capped to just
-  // GRAPH_OLD_SESSION_MAX_POINTS, but there's no cap on how many *sessions*
-  // there can be - e.g. a day with several separate Bluetooth drops) their
-  // combined markers alone could still reach or exceed MAX_GRAPH_POINTS,
-  // which would leave no real budget for the current session and, worse,
-  // push the total sent to the watch past MAX_GRAPH_POINTS entirely (the
-  // watch silently ignores anything beyond that, so s_graph_count could
-  // never reach the GraphCount it was told to expect, leaving the graph
-  // stuck on "Loading graph..." forever). Keep only the most recent older
-  // sessions' markers when that's about to happen - the current session
-  // still gets its minimum 2-point floor either way.
-  var oldBudget = MAX_GRAPH_POINTS - 2;
-  if (oldMarkers.length > oldBudget) oldMarkers = oldMarkers.slice(oldMarkers.length - oldBudget);
-
-  var currentBudget = MAX_GRAPH_POINTS - oldMarkers.length;
-  var sampled = oldMarkers.concat(downsample(current, currentBudget));
+  var sampled = downsample(arr, MAX_GRAPH_POINTS);
 
   var out = [];
   for (var j = 0; j < sampled.length; j++) {

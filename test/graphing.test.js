@@ -164,62 +164,51 @@ test('getGraphPoints keeps a sample recorded within the hour-early-entry window 
   assert.strictEqual(points.length, 3, 'a sample right at/after the floor must be kept, not dropped');
 });
 
-test('getGraphPoints compresses an earlier, disconnected session down to 2 marker points', () => {
-  const midnightTesting = [[2, 0], [5, 0], [8, 0], [11, 0], [14, 0], [17, 0], [20, 0], [23, 0]];
-  const currentSession = [[600, 20], [605, 25], [610, 30], [615, 28]];
-  const pkjs = seedHistory(RIDE_A, midnightTesting.concat(currentSession));
+// A Pebble watchapp only records while it's the running app, so a normal
+// day of real use is many bursts separated by long gaps. An earlier version
+// split the day at those gaps and compressed every "older" burst to 2
+// marker points, which threw away most of a real day's queue history. These
+// pin down that the whole recorded day is kept and thinned evenly instead.
+test('getGraphPoints keeps every burst of a normally-used day, not just the latest', () => {
+  // Four usage bursts across the day, each separated by well over an hour -
+  // exactly what a watchapp records when it's opened and closed repeatedly.
+  const samples = [];
+  [[600, 640], [760, 800], [930, 970], [1080, 1120]].forEach(([a, b]) => {
+    for (let m = a; m <= b; m += 10) samples.push([m, 20]);
+  });
+  const pkjs = seedHistory(RIDE_A, samples);
 
   const points = pkjs.getGraphPoints(RIDE_A);
-  assert.strictEqual(points.length, 2 + currentSession.length,
-    "the older session should contribute exactly 2 points, not all " + midnightTesting.length);
-  assert.strictEqual(points[0].minuteOfDay, 2, "the older session's marker points should be its first...");
-  assert.strictEqual(points[1].minuteOfDay, 23, "...and last sample, not an arbitrary pick");
-  // The full current session must survive untouched (well under budget).
-  assert.deepStrictEqual([...points.slice(2).map((p) => p.wait)], [20, 25, 30, 28]);
+  const minutes = points.map((p) => p.minuteOfDay);
+  // Every burst must be represented by more than a token marker pair.
+  [[600, 640], [760, 800], [930, 970], [1080, 1120]].forEach(([a, b]) => {
+    const inBurst = minutes.filter((m) => m >= a && m <= b);
+    assert.ok(inBurst.length >= 3,
+      `burst ${a}-${b} should keep real resolution, got only ${inBurst.length} point(s)`);
+  });
+  assert.strictEqual(minutes[0], 600, 'the day\'s first recorded sample must be kept');
+  assert.strictEqual(minutes[minutes.length - 1], 1120, 'the latest sample must be kept');
 });
 
-test('getGraphPoints does not compress anything when there is no gap', () => {
-  const pkjs = seedHistory(RIDE_A, [[600, 10], [610, 15], [620, 20]]); // normal ~10 min spacing
+test('getGraphPoints passes a short day through untouched', () => {
+  const pkjs = seedHistory(RIDE_A, [[600, 10], [610, 15], [620, 20]]);
   const points = pkjs.getGraphPoints(RIDE_A);
-  assert.strictEqual(points.length, 3, 'a single continuous session should pass through untouched');
+  assert.strictEqual(points.length, 3, 'under the point cap, nothing should be dropped');
 });
 
-test('getGraphPoints spends most of its budget on the current session even when it alone exceeds ' +
-  'MAX_GRAPH_POINTS', () => {
-  const oldSession = [[2, 0], [5, 0], [8, 0]];
-  const currentSession = [];
-  for (let m = 600; m < 600 + 40 * 5; m += 5) currentSession.push([m, m - 600]); // 40 samples
-  const pkjs = seedHistory(RIDE_A, oldSession.concat(currentSession));
-
-  const points = pkjs.getGraphPoints(RIDE_A);
-  assert.strictEqual(points.length, 24, 'total must still respect MAX_GRAPH_POINTS');
-  assert.strictEqual(points[0].minuteOfDay, 2, 'old session start marker');
-  assert.strictEqual(points[1].minuteOfDay, 8, 'old session end marker');
-  // The remaining 22 slots should span the current session's full range,
-  // not be crowded out by the (already just 2-point) old session.
-  assert.strictEqual(points[2].minuteOfDay, 600, "current session's first sample must be kept");
-  assert.strictEqual(points[points.length - 1].minuteOfDay, currentSession[currentSession.length - 1][0],
-    "current session's last sample must be kept");
-});
-
-test('getGraphPoints never exceeds MAX_GRAPH_POINTS even with many separate older sessions', () => {
-  // 15 older sessions (2 samples each, 90 min apart so each is its own
-  // session) would contribute 30 raw marker points before any capping -
-  // comfortably more than MAX_GRAPH_POINTS on their own, which is exactly
-  // what used to let the total sent to the watch overflow MAX_GRAPH_POINTS
-  // (the watch silently drops anything past that, so s_graph_count could
-  // never reach GraphCount and the graph got stuck loading forever).
+test('getGraphPoints never exceeds MAX_GRAPH_POINTS, however fragmented the day', () => {
+  // Many separate bursts: the total sent must still fit the watch's fixed
+  // MAX_GRAPH_POINTS array, or s_graph_count can never reach the GraphCount
+  // it was told to expect and the graph sticks on "Loading graph..." forever.
   const samples = [];
   for (let s = 0; s < 15; s++) samples.push([s * 90, 0], [s * 90 + 5, 0]);
-  samples.push([1350, 15], [1360, 20]); // current session, well past the last older one (gap > 60)
+  samples.push([1350, 15], [1360, 20]);
 
   const pkjs = seedHistory(RIDE_A, samples);
   const points = pkjs.getGraphPoints(RIDE_A);
   assert.ok(points.length <= 24, 'must never exceed MAX_GRAPH_POINTS: got ' + points.length);
-  assert.strictEqual(points[points.length - 1].minuteOfDay, 1360,
-    "the current session's last sample must still make it through");
-  assert.strictEqual(points[points.length - 2].minuteOfDay, 1350,
-    "the current session's first sample must still make it through");
+  assert.strictEqual(points[points.length - 1].minuteOfDay, 1360, 'the latest sample must be kept');
+  assert.strictEqual(points[0].minuteOfDay, 0, 'the earliest sample must be kept');
 });
 
 // ---------------------------------------------------------------------------
