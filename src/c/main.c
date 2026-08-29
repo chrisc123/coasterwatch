@@ -15,7 +15,9 @@
 //    to keep it in view (on the grid) or adjust the alert threshold (in a
 //    ride's detail view). SELECT (tap) opens the highlighted ride's graph
 //    from the grid, or toggles its alert from the detail view. SELECT
-//    (hold, grid only) toggles sort order between queue time and distance.
+//    (hold, grid only) cycles sort order through queue time, distance, and
+//    alerts (rides with an armed alert pinned to the top, sub-sorted by
+//    queue time; everything else below, sub-sorted by distance).
 //    BACK exits / closes the graph.
 //  - Touch (Pebble Time 2 / Round 2 hardware only — the CST816 touchscreen
 //    support added in PebbleOS PR #1796): drag vertically to scroll the
@@ -77,7 +79,7 @@
 #define ALERT_DEFAULT_MINUTES 15
 #define ALERT_BAND_HEIGHT     44
 
-typedef enum { SORT_TIME = 0, SORT_DISTANCE = 1 } SortMode;
+typedef enum { SORT_TIME = 0, SORT_DISTANCE = 1, SORT_ALERTS = 2 } SortMode;
 
 typedef struct {
   int32_t ride_id;
@@ -216,18 +218,41 @@ static int tile_cols(void) { return TILE_COLS; }
 // ---------------------------------------------------------------------------
 // Sort order
 
+// Defined further down (Per-ride queue alerts) - forward-declared so
+// compare_key can use it for SORT_ALERTS below.
+static AlertConfig *find_alert(int32_t ride_id);
+
+static int compare_wait(int a, int b) {
+  int wa = s_rides[a].wait_minutes < 0 ? 9999 : s_rides[a].wait_minutes;
+  int wb = s_rides[b].wait_minutes < 0 ? 9999 : s_rides[b].wait_minutes;
+  if (wa != wb) return wa < wb ? -1 : 1;
+  return 0;
+}
+
+static int compare_distance(int a, int b) {
+  int32_t da = s_rides[a].distance_m < 0 ? INT32_MAX : s_rides[a].distance_m;
+  int32_t db = s_rides[b].distance_m < 0 ? INT32_MAX : s_rides[b].distance_m;
+  if (da != db) return da < db ? -1 : 1;
+  return 0;
+}
+
+static bool ride_alert_armed(int idx) {
+  AlertConfig *a = find_alert(s_rides[idx].ride_id);
+  return a && a->enabled;
+}
+
 static int compare_key(int a, int b) {
-  if (s_sort_mode == SORT_DISTANCE) {
-    int32_t da = s_rides[a].distance_m < 0 ? INT32_MAX : s_rides[a].distance_m;
-    int32_t db = s_rides[b].distance_m < 0 ? INT32_MAX : s_rides[b].distance_m;
-    if (da != db) return da < db ? -1 : 1;
-    return 0;
-  } else {
-    int wa = s_rides[a].wait_minutes < 0 ? 9999 : s_rides[a].wait_minutes;
-    int wb = s_rides[b].wait_minutes < 0 ? 9999 : s_rides[b].wait_minutes;
-    if (wa != wb) return wa < wb ? -1 : 1;
-    return 0;
+  if (s_sort_mode == SORT_ALERTS) {
+    // Armed-alert rides pinned to the top (sub-sorted by queue length, so
+    // the ones worth checking first surface first); everything else below,
+    // sub-sorted by distance like SORT_DISTANCE on its own.
+    bool aa = ride_alert_armed(a);
+    bool ab = ride_alert_armed(b);
+    if (aa != ab) return aa ? -1 : 1;
+    return aa ? compare_wait(a, b) : compare_distance(a, b);
   }
+  if (s_sort_mode == SORT_DISTANCE) return compare_distance(a, b);
+  return compare_wait(a, b);
 }
 
 // Small N (<= MAX_RIDES): a plain insertion sort is simpler than qsort here
@@ -446,8 +471,10 @@ static void update_header(void) {
   } else if (s_ride_count == 0) {
     status[0] = '\0';
   } else {
-    snprintf(status, sizeof(status), "Sort: %s",
-             s_sort_mode == SORT_DISTANCE ? "Distance" : "Time");
+    const char *sort_name = "Time";
+    if (s_sort_mode == SORT_DISTANCE) sort_name = "Distance";
+    else if (s_sort_mode == SORT_ALERTS) sort_name = "Alerts";
+    snprintf(status, sizeof(status), "Sort: %s", sort_name);
   }
 
   if (s_clock_layer) {
@@ -864,8 +891,10 @@ static void select_click_handler(ClickRecognizerRef recognizer, void *context) {
   open_detail_window();
 }
 
-static void toggle_sort_mode(void) {
-  s_sort_mode = (s_sort_mode == SORT_TIME) ? SORT_DISTANCE : SORT_TIME;
+static void cycle_sort_mode(void) {
+  if (s_sort_mode == SORT_TIME) s_sort_mode = SORT_DISTANCE;
+  else if (s_sort_mode == SORT_DISTANCE) s_sort_mode = SORT_ALERTS;
+  else s_sort_mode = SORT_TIME;
   persist_write_int(SETTINGS_SORT_KEY, s_sort_mode);
   recompute_order();
   update_header();
@@ -874,7 +903,7 @@ static void toggle_sort_mode(void) {
 }
 
 static void select_long_click_handler(ClickRecognizerRef recognizer, void *context) {
-  toggle_sort_mode();
+  cycle_sort_mode();
 }
 
 static void click_config_provider(void *context) {
