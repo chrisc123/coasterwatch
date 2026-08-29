@@ -1218,10 +1218,18 @@ static void inbox_received_callback(DictionaryIterator *iter, void *context) {
   Tuple *t_gm = dict_find(iter, MESSAGE_KEY_GraphMinuteOfDay);
   if (t_gi && t_gw && t_gm) {
     int gi = t_gi->value->int32;
-    if (gi >= 0 && gi < MAX_GRAPH_POINTS) {
+    // Only accept a point that exactly fills the next slot (gi == count).
+    // pkjs normally streams strictly in order, but if the user opens another
+    // ride's detail view before the previous one's points finished sending,
+    // a straggler from the old stream can still arrive after this one's
+    // GraphCount reset. Accepting anything other than the exact next index
+    // (a stale duplicate, or a gap from a dropped point) risks s_graph_count
+    // claiming a contiguous run that's actually got an untouched — and
+    // therefore still holding the *previous* ride's — slot in the middle.
+    if (gi == s_graph_count && gi < MAX_GRAPH_POINTS) {
       s_graph_points[gi] = (int16_t)t_gw->value->int32;
       s_graph_minute_of_day[gi] = (int16_t)t_gm->value->int32;
-      if (gi + 1 > s_graph_count) s_graph_count = gi + 1;
+      s_graph_count = gi + 1;
       s_graph_loading = false;
       if (s_detail_graph_layer) layer_mark_dirty(s_detail_graph_layer);
     }

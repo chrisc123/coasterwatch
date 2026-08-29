@@ -489,18 +489,29 @@ function sendError(msg) {
   Pebble.sendAppMessage({ 'ErrorMsg': msg.substring(0, 40) });
 }
 
-function sendGraphPoint(i, points) {
+// Bumped by every sendGraph() call and captured by its own point-sending
+// chain (sendGraphPoint's `seq` param) — if the user opens another ride's
+// detail view before the previous one's points finished streaming, the
+// stale chain's `seq` no longer matches and it quietly stops instead of
+// interleaving its remaining points with the new ride's stream.
+var graphRequestSeq = 0;
+
+function sendGraphPoint(i, points, seq) {
+  if (seq !== graphRequestSeq) return;
   if (i >= points.length) return;
   var p = points[i];
   var dict = { 'GraphIndex': i, 'GraphWait': p.wait, 'GraphMinuteOfDay': p.minuteOfDay };
   Pebble.sendAppMessage(dict, function () {
-    sendGraphPoint(i + 1, points);
+    sendGraphPoint(i + 1, points, seq);
   }, function () {
-    setTimeout(function () { sendGraphPoint(i, points); }, 300);
+    if (seq !== graphRequestSeq) return;
+    setTimeout(function () { sendGraphPoint(i, points, seq); }, 300);
   });
 }
 
 function sendGraph(rideId) {
+  graphRequestSeq++;
+  var seq = graphRequestSeq;
   var points = getGraphPoints(rideId);
   if (!points) {
     Pebble.sendAppMessage({ 'GraphError': 'Not enough data recorded yet today' });
@@ -510,7 +521,7 @@ function sendGraph(rideId) {
   var peg = graphPegMinuteOfDay();
   if (peg !== null) dict['GraphPegMinuteOfDay'] = peg;
   Pebble.sendAppMessage(dict, function () {
-    sendGraphPoint(0, points);
+    sendGraphPoint(0, points, seq);
   }, function () {
     console.log('CoasterWatch: failed to send GraphCount');
   });
