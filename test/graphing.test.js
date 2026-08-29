@@ -202,6 +202,26 @@ test('getGraphPoints spends most of its budget on the current session even when 
     "current session's last sample must be kept");
 });
 
+test('getGraphPoints never exceeds MAX_GRAPH_POINTS even with many separate older sessions', () => {
+  // 15 older sessions (2 samples each, 90 min apart so each is its own
+  // session) would contribute 30 raw marker points before any capping -
+  // comfortably more than MAX_GRAPH_POINTS on their own, which is exactly
+  // what used to let the total sent to the watch overflow MAX_GRAPH_POINTS
+  // (the watch silently drops anything past that, so s_graph_count could
+  // never reach GraphCount and the graph got stuck loading forever).
+  const samples = [];
+  for (let s = 0; s < 15; s++) samples.push([s * 90, 0], [s * 90 + 5, 0]);
+  samples.push([1350, 15], [1360, 20]); // current session, well past the last older one (gap > 60)
+
+  const pkjs = seedHistory(RIDE_A, samples);
+  const points = pkjs.getGraphPoints(RIDE_A);
+  assert.ok(points.length <= 24, 'must never exceed MAX_GRAPH_POINTS: got ' + points.length);
+  assert.strictEqual(points[points.length - 1].minuteOfDay, 1360,
+    "the current session's last sample must still make it through");
+  assert.strictEqual(points[points.length - 2].minuteOfDay, 1350,
+    "the current session's first sample must still make it through");
+});
+
 // ---------------------------------------------------------------------------
 // Park hours cross-check (the "Energylandia shows 0m while actually closed" bug)
 

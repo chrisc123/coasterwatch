@@ -42,7 +42,11 @@
 // line is skipped (see detail_graph_update_proc) - well above the normal
 // ~5-15 min refresh cadence (REFRESH_INTERVAL_MS below, further stretched
 // on low battery), so it only fires on a real gap (app closed/backgrounded
-// a while, watch put away), not just a slow refresh tick.
+// a while, watch put away), not just a slow refresh tick. Keep in sync with
+// GRAPH_SESSION_GAP_MINUTES in pkjs/index.js — that's what decides which
+// points get compressed to 2-point markers in the first place; a mismatch
+// wouldn't break anything, just make a compressed marker pair not visually
+// read as a gap here, or vice versa.
 #define GRAPH_GAP_MINUTES 60
 #define TILE_COLS         2
 #define NAME_BUF_LEN      24
@@ -1277,6 +1281,13 @@ static void retry_request_refresh_callback(void *data) {
 }
 
 static void retry_request_graph_callback(void *data) {
+  // Only still relevant if the detail window is still open on the same
+  // ride the failed send was for — the graph response protocol has no
+  // ride id of its own (just index/wait/minute), so a stale retry firing
+  // after the user has since switched rides (or backed out entirely, which
+  // resets s_detail_ride_id to -1) would get misread as fresh data for
+  // whatever's open now, corrupting that ride's graph with this one's.
+  if (s_pending_graph_retry_id != s_detail_ride_id) return;
   request_graph(s_pending_graph_retry_id);
 }
 

@@ -432,7 +432,11 @@ function appendHistory(rides) {
 // separate sessions - well above the normal ~5-15 min refresh cadence
 // (REFRESH_INTERVAL_MS in main.c, further stretched on low battery), so it
 // only fires on a real gap (app closed/backgrounded a while, watch put
-// away), not just a slow refresh tick.
+// away), not just a slow refresh tick. Keep in sync with GRAPH_GAP_MINUTES
+// in main.c — that's what decides whether the watch draws a connecting
+// line into a point, purely visually; a mismatch wouldn't break anything,
+// just make a compressed marker pair not visually read as a gap there, or
+// vice versa.
 var GRAPH_SESSION_GAP_MINUTES = 60;
 
 // How many points an *older* (not-current) session is allowed to keep -
@@ -516,8 +520,21 @@ function getGraphPoints(rideId) {
   for (var s = 0; s < older.length; s++) {
     oldMarkers = oldMarkers.concat(downsample(older[s], GRAPH_OLD_SESSION_MAX_POINTS));
   }
+  // With enough older sessions (each already capped to just
+  // GRAPH_OLD_SESSION_MAX_POINTS, but there's no cap on how many *sessions*
+  // there can be - e.g. a day with several separate Bluetooth drops) their
+  // combined markers alone could still reach or exceed MAX_GRAPH_POINTS,
+  // which would leave no real budget for the current session and, worse,
+  // push the total sent to the watch past MAX_GRAPH_POINTS entirely (the
+  // watch silently ignores anything beyond that, so s_graph_count could
+  // never reach the GraphCount it was told to expect, leaving the graph
+  // stuck on "Loading graph..." forever). Keep only the most recent older
+  // sessions' markers when that's about to happen - the current session
+  // still gets its minimum 2-point floor either way.
+  var oldBudget = MAX_GRAPH_POINTS - 2;
+  if (oldMarkers.length > oldBudget) oldMarkers = oldMarkers.slice(oldMarkers.length - oldBudget);
 
-  var currentBudget = Math.max(2, MAX_GRAPH_POINTS - oldMarkers.length);
+  var currentBudget = MAX_GRAPH_POINTS - oldMarkers.length;
   var sampled = oldMarkers.concat(downsample(current, currentBudget));
 
   var out = [];
