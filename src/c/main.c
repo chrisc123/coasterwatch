@@ -612,7 +612,7 @@ static GridMetrics compute_grid_metrics(void) {
 
   m.total_rows = (s_ride_count + m.cols - 1) / m.cols;
   if (m.total_rows < 1) m.total_rows = 1;
-  m.content_h = m.pad + m.total_rows * (m.tile_h + m.pad) + attribution_height(m.w) + m.pad;
+  m.content_h = m.pad + m.total_rows * (m.tile_h + m.pad) + attribution_height(m.w - 2 * m.pad) + m.pad;
   if (m.content_h < m.h) m.content_h = m.h;
   return m;
 }
@@ -626,10 +626,13 @@ static GRect tile_rect_for_slot(const GridMetrics *m, int slot) {
                m->tile_w, m->tile_h);
 }
 
-// Full-width footer below the last ride row.
+// Footer below the last ride row, inset by m->pad on each side to match the
+// tile grid's own left/right edges - same margin, same reasoning as
+// TILE_PAD (see its definition).
 static GRect attribution_rect(const GridMetrics *m) {
   int y = m->pad + m->total_rows * (m->tile_h + m->pad);
-  return GRect(0, y, m->w, attribution_height(m->w));
+  int w = m->w - 2 * m->pad;
+  return GRect(m->pad, y, w, attribution_height(w));
 }
 
 static void scroll_to_show_cursor(bool animated) {
