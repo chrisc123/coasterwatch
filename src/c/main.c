@@ -49,6 +49,12 @@
 // read as a gap here, or vice versa.
 #define GRAPH_GAP_MINUTES 60
 #define TILE_COLS         2
+// Grid margin: gap from the screen edge to the outermost tile, and between
+// tiles - see compute_grid_metrics(). Also used to line up the header's
+// clock/sort text with the tile grid directly below it (clock_update_proc,
+// header_update_proc), so the two can't silently drift out of alignment
+// with each other.
+#define TILE_PAD           4
 #define NAME_BUF_LEN      24
 // Minimum gap deliberately reserved between a text element and whatever's
 // immediately next to it (a tile's own bottom edge, an adjacent layer's
@@ -419,9 +425,11 @@ static void clock_update_proc(Layer *layer, GContext *ctx) {
   // Background fill spans the layer's full width (flush against the
   // screen's left edge, like the rest of the header bar); the text itself
   // draws within a rect inset from that same edge - see header_update_proc
-  // for why these need to be sized independently.
-  GRect text_bounds = GRect(bounds.origin.x + TEXT_EDGE_PADDING, bounds.origin.y,
-                             bounds.size.w - TEXT_EDGE_PADDING, bounds.size.h);
+  // for why these need to be sized independently. TILE_PAD (not
+  // TEXT_EDGE_PADDING) so the clock's left edge lines up with the tile
+  // grid's own leftmost edge directly below it.
+  GRect text_bounds = GRect(bounds.origin.x + TILE_PAD, bounds.origin.y,
+                             bounds.size.w - TILE_PAD, bounds.size.h);
   GFont font = fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD);
   GSize content = graphics_text_layout_get_content_size(s_clock_buf, font, text_bounds,
                                                          GTextOverflowModeFill, GTextAlignmentLeft);
@@ -476,13 +484,14 @@ static void header_update_proc(Layer *layer, GContext *ctx) {
 #else
   // Right-aligned against the clock on the left (see the alignment comment
   // in main_window_load) - solid black bar spans the layer's full width,
-  // but the text itself is drawn within a rect inset a few px from the
-  // right edge so it doesn't sit flush against the physical screen edge.
+  // but the text itself is drawn within a rect inset from the right edge
+  // by TILE_PAD (not TEXT_EDGE_PADDING), so its right edge lines up with
+  // the tile grid's own rightmost edge directly below it.
   graphics_context_set_fill_color(ctx, GColorBlack);
   graphics_fill_rect(ctx, bounds, 0, GCornerNone);
   graphics_context_set_text_color(ctx, GColorWhite);
   align = GTextAlignmentRight;
-  text_bounds = GRect(bounds.origin.x, bounds.origin.y, bounds.size.w - TEXT_EDGE_PADDING, bounds.size.h);
+  text_bounds = GRect(bounds.origin.x, bounds.origin.y, bounds.size.w - TILE_PAD, bounds.size.h);
 #endif
   GSize content = graphics_text_layout_get_content_size(s_header_buf, font, text_bounds,
                                                          GTextOverflowModeFill, align);
@@ -584,7 +593,7 @@ static GridMetrics compute_grid_metrics(void) {
   GridMetrics m;
   m.w = s_scroll_frame.size.w;
   m.h = s_scroll_frame.size.h;
-  m.pad = 4;
+  m.pad = TILE_PAD;
   m.cols = tile_cols();
   int screen_rows = tile_rows();
   m.tile_w = (m.w - m.pad * (m.cols + 1)) / m.cols;
