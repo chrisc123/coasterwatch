@@ -122,7 +122,7 @@ static GFont s_ride_name_font;
 #endif
 
 static Window      *s_main_window;
-static TextLayer   *s_header_layer;
+static Layer       *s_header_layer;
 static TextLayer   *s_clock_layer;
 static ScrollLayer *s_scroll_layer;
 static Layer       *s_grid_content_layer;
@@ -440,7 +440,36 @@ static void update_header(void) {
       snprintf(s_header_buf, sizeof(s_header_buf), "%s", clock_buf);
     }
   }
-  text_layer_set_text(s_header_layer, s_header_buf);
+  if (s_header_layer) layer_mark_dirty(s_header_layer);
+}
+
+static void header_update_proc(Layer *layer, GContext *ctx) {
+  GRect bounds = layer_get_bounds(layer);
+  GFont font = fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD);
+  GTextAlignment align;
+  GRect text_bounds;
+#if defined(PBL_ROUND)
+  // One combined centered string (see update_header) - no background fill
+  // needed, this sits directly on the round header's own background.
+  align = GTextAlignmentCenter;
+  text_bounds = bounds;
+  graphics_context_set_text_color(ctx, GColorBlack);
+#else
+  // Right-aligned against the clock on the left (see the alignment comment
+  // in main_window_load) - solid black bar spans the layer's full width,
+  // but the text itself is drawn within a rect inset a few px from the
+  // right edge so it doesn't sit flush against the physical screen edge.
+  graphics_context_set_fill_color(ctx, GColorBlack);
+  graphics_fill_rect(ctx, bounds, 0, GCornerNone);
+  graphics_context_set_text_color(ctx, GColorWhite);
+  align = GTextAlignmentRight;
+  text_bounds = GRect(bounds.origin.x, bounds.origin.y, bounds.size.w - TEXT_EDGE_PADDING, bounds.size.h);
+#endif
+  GSize content = graphics_text_layout_get_content_size(s_header_buf, font, text_bounds,
+                                                         GTextOverflowModeFill, align);
+  int y = text_bounds.origin.y + (text_bounds.size.h - content.h) / 2;
+  GRect draw_rect = GRect(text_bounds.origin.x, y, text_bounds.size.w, content.h);
+  graphics_draw_text(ctx, s_header_buf, font, draw_rect, GTextOverflowModeFill, align, NULL);
 }
 
 // Picks black or white text for a given fill so any user-chosen color (not
@@ -1409,9 +1438,7 @@ static void main_window_load(Window *window) {
 #if defined(PBL_ROUND)
   static const int ROUND_HEADER_Y_OFFSET = 14;
   s_clock_layer = NULL;
-  s_header_layer = text_layer_create(GRect(0, ROUND_HEADER_Y_OFFSET, bounds.size.w, HEADER_HEIGHT));
-  text_layer_set_background_color(s_header_layer, GColorClear);
-  text_layer_set_text_color(s_header_layer, GColorBlack);
+  s_header_layer = layer_create(GRect(0, ROUND_HEADER_Y_OFFSET, bounds.size.w, HEADER_HEIGHT));
 #else
   s_clock_layer = text_layer_create(GRect(0, 0, HEADER_CLOCK_WIDTH, HEADER_HEIGHT));
   text_layer_set_background_color(s_clock_layer, GColorBlack);
@@ -1420,23 +1447,13 @@ static void main_window_load(Window *window) {
   text_layer_set_text_alignment(s_clock_layer, GTextAlignmentLeft);
   layer_add_child(root, text_layer_get_layer(s_clock_layer));
 
-  // Full remaining width, not shrunk for text breathing room — this is a
-  // TextLayer, so its own bounds are also its background fill; shrinking it
-  // left a plain white gap at the screen's right edge instead of the solid
-  // black bar the rest of the header shows. TextLayer's own text rendering
-  // already keeps a small inset from its edges, so right-aligned text here
-  // doesn't run into the physical screen edge either.
-  s_header_layer = text_layer_create(GRect(HEADER_CLOCK_WIDTH, 0,
-                                            bounds.size.w - HEADER_CLOCK_WIDTH, HEADER_HEIGHT));
-  text_layer_set_background_color(s_header_layer, GColorBlack);
-  text_layer_set_text_color(s_header_layer, GColorWhite);
+  // Full remaining width: the background fill needs to reach the screen's
+  // true right edge (see header_update_proc for how the text itself still
+  // gets an inset from it, without shrinking the fill to match).
+  s_header_layer = layer_create(GRect(HEADER_CLOCK_WIDTH, 0, bounds.size.w - HEADER_CLOCK_WIDTH, HEADER_HEIGHT));
 #endif
-  text_layer_set_font(s_header_layer, fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD));
-  // Rect: right-aligned against the clock on the left — "centered in the
-  // space left over after the clock" looked visibly off-center instead.
-  // Round: still one combined centered string, so center is correct there.
-  text_layer_set_text_alignment(s_header_layer, PBL_IF_ROUND_ELSE(GTextAlignmentCenter, GTextAlignmentRight));
-  layer_add_child(root, text_layer_get_layer(s_header_layer));
+  layer_set_update_proc(s_header_layer, header_update_proc);
+  layer_add_child(root, s_header_layer);
 
   tick_timer_service_subscribe(MINUTE_UNIT, clock_tick_handler);
   update_clock();
@@ -1497,7 +1514,7 @@ static void main_window_unload(Window *window) {
   tick_timer_service_unsubscribe();
   layer_destroy(s_grid_content_layer);
   scroll_layer_destroy(s_scroll_layer);
-  text_layer_destroy(s_header_layer);
+  layer_destroy(s_header_layer);
   if (s_clock_layer) text_layer_destroy(s_clock_layer);
 }
 
