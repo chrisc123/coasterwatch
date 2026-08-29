@@ -1004,10 +1004,15 @@ static void detail_alert_update_proc(Layer *layer, GContext *ctx) {
   } else {
     snprintf(buf, sizeof(buf), "Alert off");
   }
+  // label_rect is taller than the label needs (room for "Alert ON: <Nm" to
+  // wrap to a second line on narrower screens) - top-anchoring left it
+  // sitting high with a gap below. The +/- buttons above don't have this
+  // problem (confirmed against a real-watch screenshot they're correct
+  // as-is): minus_rect/plus_rect are sized close to what a single symbol
+  // glyph actually needs, so there's no meaningful gap to begin with.
   GRect label_rect = GRect(minus_rect.origin.x + minus_rect.size.w, 4,
                             plus_rect.origin.x - (minus_rect.origin.x + minus_rect.size.w), bounds.size.h - 8);
-  graphics_draw_text(ctx, buf, fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD), label_rect,
-                      GTextOverflowModeFill, GTextAlignmentCenter, NULL);
+  draw_vcentered_text(ctx, buf, fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD), label_rect, GTextOverflowModeFill);
 }
 
 static void toggle_alert_for_current_ride(void) {
