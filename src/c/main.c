@@ -1169,6 +1169,13 @@ static void toggle_alert_for_current_ride(void) {
   save_alerts();
   vibes_short_pulse();
   if (s_detail_alert_layer) layer_mark_dirty(s_detail_alert_layer);
+  // Armed state feeds into SORT_ALERTS' ordering (a no-op, cheap enough not
+  // to bother guarding, in the other two sort modes) - without this the
+  // grid kept showing whatever order it last computed until the next data
+  // refresh happened to trigger one, even though this ride had just moved
+  // to (or out of) the pinned section.
+  recompute_order();
+  if (s_grid_content_layer) layer_mark_dirty(s_grid_content_layer);
 }
 
 static void adjust_alert_threshold(int delta) {
