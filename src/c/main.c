@@ -374,26 +374,61 @@ static void load_band_config(void) {
 }
 
 // Pebble apps can't invoke the watch's own system alert-vibe picker (that's
-// a user-facing OS setting, not an exposed API) — these are our own custom
-// VibePattern durations instead, just named in that same recognizable
-// style. Index here is what travels over AppMessage (VibePattern key) and
-// gets persisted in BandConfig.vibe_pattern — append, don't reorder, so a
-// previously saved index keeps meaning the same pattern.
+// a user-facing OS setting, not an exposed API), so these are app-side
+// VibePattern durations. Three of them reproduce a real PebbleOS vibe score
+// exactly; the fourth is deliberately our own and named so it doesn't claim
+// otherwise.
+//
+// Timings taken from PebbleOS itself (resources/normal/snowy/vibes/*.json at
+// tag v4.36.2), not guessed. Each score is a list of notes with a duration,
+// a strength (0-100) and a motor brake time; a 0-strength note is silence.
+// A score whose notes are all 100% maps exactly onto VibePattern's
+// alternating on/off durations, which is why only those three are here:
+//   Standard (Short Pulse) - High : 250ms @100%
+//   Nudge Nudge                   : 30ms @100%, 100ms silence, 30ms @100%
+//   Jackhammer                    : 6 x (50ms @100% + 50ms brake)
+// PebbleOS's Mario, Reveille, Pulse and Gentle all vary strength mid-score
+// (Mario alone uses 40/55/76/100%), so VibePattern cannot express them —
+// this app previously shipped a "Mario" and a "Heartbeat" that matched
+// nothing in the OS (there is no Heartbeat score at all), and those are gone
+// rather than pretending.
+//
+// That "cannot" is an SDK gap, not a hardware one, and is worth revisiting:
+// PebbleOS gained vibes_enqueue_custom_pattern_with_amplitudes() in commit
+// 03a8ac0c ("add per-segment amplitude control to public SDK", 2026-02-16),
+// which takes a per-segment amplitude array and is present in firmware from
+// v4.33.1 onward. It just isn't in the published SDK yet — SDK 4.33.1 (the
+// newest on sdk.repebble.com as of writing) declares no such prototype and
+// its libpebble.a exports no such symbol on any platform, so it can't be
+// linked. When an SDK ships it, the strength-varying scores above become
+// reproducible verbatim.
+//
+// Index here is what travels over AppMessage (VibePattern key) and gets
+// persisted in BandConfig.vibe_pattern. Index 0 keeps the exact durations
+// the old index 0 had, so an existing saved default still vibrates
+// identically; 1-3 changed meaning, but those were the inaccurate ones.
+// Append, don't reorder, from here on.
 typedef struct {
   const uint32_t *durations;
   uint32_t num_segments;
 } VibePatternPreset;
 
-static const uint32_t s_vibe_standard[]  = {400, 200, 400, 200, 400};
-static const uint32_t s_vibe_nudge[]     = {100, 100, 100};
-static const uint32_t s_vibe_mario[]     = {60, 60, 60, 60, 60, 60, 180};
-static const uint32_t s_vibe_heartbeat[] = {100, 150, 100, 400};
+// Ours, not an OS score: three firm buzzes, for an alert worth not missing
+// in a noisy park. Kept at index 0 both on its merits and so the stored
+// default's behavior is unchanged by this correction.
+static const uint32_t s_vibe_triple[]     = {400, 200, 400, 200, 400};
+// PebbleOS "Standard (Short Pulse) - High" — its default for notifications.
+static const uint32_t s_vibe_standard[]   = {250};
+// PebbleOS "Nudge Nudge".
+static const uint32_t s_vibe_nudge[]      = {30, 100, 30};
+// PebbleOS "Jackhammer": 6 on-pulses, hence 11 alternating segments.
+static const uint32_t s_vibe_jackhammer[] = {50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50};
 
 static const VibePatternPreset VIBE_PATTERNS[] = {
-  { s_vibe_standard,  ARRAY_LENGTH(s_vibe_standard) },  // 0: Standard
-  { s_vibe_nudge,     ARRAY_LENGTH(s_vibe_nudge) },     // 1: Nudge
-  { s_vibe_mario,     ARRAY_LENGTH(s_vibe_mario) },     // 2: Mario
-  { s_vibe_heartbeat, ARRAY_LENGTH(s_vibe_heartbeat) }, // 3: Heartbeat
+  { s_vibe_triple,     ARRAY_LENGTH(s_vibe_triple) },     // 0: Triple Buzz (ours)
+  { s_vibe_standard,   ARRAY_LENGTH(s_vibe_standard) },   // 1: Standard
+  { s_vibe_nudge,      ARRAY_LENGTH(s_vibe_nudge) },      // 2: Nudge Nudge
+  { s_vibe_jackhammer, ARRAY_LENGTH(s_vibe_jackhammer) }, // 3: Jackhammer
 };
 #define VIBE_PATTERN_COUNT ((int)(sizeof(VIBE_PATTERNS) / sizeof(VIBE_PATTERNS[0])))
 

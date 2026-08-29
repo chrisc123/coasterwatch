@@ -20,8 +20,11 @@ var BANDS_KEY = 'bandConfig';
 var DEFAULT_BANDS = { t1: 10, t2: 30, c0: 204, c1: 244, c2: 240, cAlert: 227, vibePattern: 0 };
 
 // Must stay in the same order as VIBE_PATTERNS in src/c/main.c — the index
-// is what's actually sent/persisted, not the name.
-var VIBE_PATTERN_NAMES = ['Standard', 'Nudge', 'Mario', 'Heartbeat'];
+// is what's actually sent/persisted, not the name. "Triple Buzz" is this
+// app's own; the other three reproduce the PebbleOS vibe score of the same
+// name exactly (see the VIBE_PATTERNS comment in main.c for the timings and
+// where they came from).
+var VIBE_PATTERN_NAMES = ['Triple Buzz', 'Standard', 'Nudge Nudge', 'Jackhammer'];
 
 // ---------------------------------------------------------------------------
 // Supported parks. Each entry is hand-researched (not an open pick-any-park
