@@ -76,9 +76,6 @@
 #define ALERT_MAX_MINUTES    120
 #define ALERT_DEFAULT_MINUTES 15
 #define ALERT_BAND_HEIGHT     44
-// queue-times.com's terms require this attribution "somewhere prominent" —
-// a full-width footer tile at the end of the ride list.
-#define ATTRIBUTION_HEIGHT    34
 
 typedef enum { SORT_TIME = 0, SORT_DISTANCE = 1 } SortMode;
 
@@ -589,6 +586,20 @@ typedef struct {
   int content_h;
 } GridMetrics;
 
+// queue-times.com's terms require this attribution "somewhere prominent" —
+// a full-width footer tile at the end of the ride list. Height is however
+// tall "Powered by Queue-Times.com" actually needs to be at this
+// platform's width - one line on wider screens (emery/gabbro), wrapped to
+// two on narrower ones (basalt/chalk). Measured directly rather than a
+// single fixed guess, which was either wastefully tall on the wide
+// platforms or clipped the wrapped second line on the narrow ones.
+static int attribution_height(int width) {
+  GSize content = graphics_text_layout_get_content_size(
+      "Powered by Queue-Times.com", fonts_get_system_font(FONT_KEY_GOTHIC_14),
+      GRect(0, 0, width, 9999), GTextOverflowModeWordWrap, GTextAlignmentCenter);
+  return content.h + 8; // a little breathing room above/below the text
+}
+
 static GridMetrics compute_grid_metrics(void) {
   GridMetrics m;
   m.w = s_scroll_frame.size.w;
@@ -601,7 +612,7 @@ static GridMetrics compute_grid_metrics(void) {
 
   m.total_rows = (s_ride_count + m.cols - 1) / m.cols;
   if (m.total_rows < 1) m.total_rows = 1;
-  m.content_h = m.pad + m.total_rows * (m.tile_h + m.pad) + ATTRIBUTION_HEIGHT + m.pad;
+  m.content_h = m.pad + m.total_rows * (m.tile_h + m.pad) + attribution_height(m.w) + m.pad;
   if (m.content_h < m.h) m.content_h = m.h;
   return m;
 }
@@ -618,7 +629,7 @@ static GRect tile_rect_for_slot(const GridMetrics *m, int slot) {
 // Full-width footer below the last ride row.
 static GRect attribution_rect(const GridMetrics *m) {
   int y = m->pad + m->total_rows * (m->tile_h + m->pad);
-  return GRect(0, y, m->w, ATTRIBUTION_HEIGHT);
+  return GRect(0, y, m->w, attribution_height(m->w));
 }
 
 static void scroll_to_show_cursor(bool animated) {
@@ -822,8 +833,8 @@ static void grid_update_proc(Layer *layer, GContext *ctx) {
   graphics_context_set_stroke_color(ctx, GColorBlack);
   graphics_draw_round_rect(ctx, attr, 4);
   graphics_context_set_text_color(ctx, GColorBlack);
-  graphics_draw_text(ctx, "Powered by Queue-Times.com", fonts_get_system_font(FONT_KEY_GOTHIC_14),
-                      attr, GTextOverflowModeWordWrap, GTextAlignmentCenter, NULL);
+  draw_vcentered_text(ctx, "Powered by Queue-Times.com", fonts_get_system_font(FONT_KEY_GOTHIC_14), attr,
+                       GTextOverflowModeWordWrap);
 }
 
 static void open_detail_window(void);
