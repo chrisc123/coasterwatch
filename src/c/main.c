@@ -123,7 +123,7 @@ static GFont s_ride_name_font;
 
 static Window      *s_main_window;
 static Layer       *s_header_layer;
-static TextLayer   *s_clock_layer;
+static Layer       *s_clock_layer;
 static ScrollLayer *s_scroll_layer;
 static Layer       *s_grid_content_layer;
 static AppTimer    *s_refresh_timer;
@@ -162,6 +162,7 @@ static bool     s_show_error      = false;
 static SortMode s_sort_mode       = SORT_TIME;
 
 static char s_header_buf[40];
+static char s_clock_buf[8];
 static char s_error_buf[48];
 
 static int32_t s_detail_ride_id = -1;
@@ -400,15 +401,33 @@ static void update_header(void);
 // string instead, so this just re-runs that.
 static void update_clock(void) {
   if (s_clock_layer) {
-    static char s_clock_buf[8];
     time_t now = time(NULL);
     struct tm *tick_time = localtime(&now);
     strftime(s_clock_buf, sizeof(s_clock_buf),
              clock_is_24h_style() ? "%H:%M" : "%I:%M", tick_time);
-    text_layer_set_text(s_clock_layer, s_clock_buf);
+    layer_mark_dirty(s_clock_layer);
   } else {
     update_header();
   }
+}
+
+static void clock_update_proc(Layer *layer, GContext *ctx) {
+  GRect bounds = layer_get_bounds(layer);
+  graphics_context_set_fill_color(ctx, GColorBlack);
+  graphics_fill_rect(ctx, bounds, 0, GCornerNone);
+  graphics_context_set_text_color(ctx, GColorWhite);
+  // Background fill spans the layer's full width (flush against the
+  // screen's left edge, like the rest of the header bar); the text itself
+  // draws within a rect inset from that same edge - see header_update_proc
+  // for why these need to be sized independently.
+  GRect text_bounds = GRect(bounds.origin.x + TEXT_EDGE_PADDING, bounds.origin.y,
+                             bounds.size.w - TEXT_EDGE_PADDING, bounds.size.h);
+  GFont font = fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD);
+  GSize content = graphics_text_layout_get_content_size(s_clock_buf, font, text_bounds,
+                                                         GTextOverflowModeFill, GTextAlignmentLeft);
+  int y = text_bounds.origin.y + (text_bounds.size.h - content.h) / 2;
+  GRect draw_rect = GRect(text_bounds.origin.x, y, text_bounds.size.w, content.h);
+  graphics_draw_text(ctx, s_clock_buf, font, draw_rect, GTextOverflowModeFill, GTextAlignmentLeft, NULL);
 }
 
 static void clock_tick_handler(struct tm *tick_time, TimeUnits units_changed) {
@@ -1440,12 +1459,9 @@ static void main_window_load(Window *window) {
   s_clock_layer = NULL;
   s_header_layer = layer_create(GRect(0, ROUND_HEADER_Y_OFFSET, bounds.size.w, HEADER_HEIGHT));
 #else
-  s_clock_layer = text_layer_create(GRect(0, 0, HEADER_CLOCK_WIDTH, HEADER_HEIGHT));
-  text_layer_set_background_color(s_clock_layer, GColorBlack);
-  text_layer_set_text_color(s_clock_layer, GColorWhite);
-  text_layer_set_font(s_clock_layer, fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD));
-  text_layer_set_text_alignment(s_clock_layer, GTextAlignmentLeft);
-  layer_add_child(root, text_layer_get_layer(s_clock_layer));
+  s_clock_layer = layer_create(GRect(0, 0, HEADER_CLOCK_WIDTH, HEADER_HEIGHT));
+  layer_set_update_proc(s_clock_layer, clock_update_proc);
+  layer_add_child(root, s_clock_layer);
 
   // Full remaining width: the background fill needs to reach the screen's
   // true right edge (see header_update_proc for how the text itself still
@@ -1515,7 +1531,7 @@ static void main_window_unload(Window *window) {
   layer_destroy(s_grid_content_layer);
   scroll_layer_destroy(s_scroll_layer);
   layer_destroy(s_header_layer);
-  if (s_clock_layer) text_layer_destroy(s_clock_layer);
+  if (s_clock_layer) layer_destroy(s_clock_layer);
 }
 
 static void init(void) {
