@@ -50,6 +50,12 @@
 #define GRAPH_GAP_MINUTES 60
 #define TILE_COLS         2
 #define NAME_BUF_LEN      24
+// Minimum gap deliberately reserved between a text element and whatever's
+// immediately next to it (a tile's own bottom edge, an adjacent layer's
+// boundary) - drawing text flush against an edge, even in an otherwise
+// tightly-sized box, reads as touching/cramped rather than intentionally
+// placed there.
+#define TEXT_EDGE_PADDING 3
 #define HEADER_HEIGHT       18
 #define HEADER_CLOCK_WIDTH  50
 #define SETTINGS_SORT_KEY    1
@@ -746,7 +752,7 @@ static void grid_update_proc(Layer *layer, GContext *ctx) {
     if (show_distance) {
       char dist_buf[12];
       format_distance(r->distance_m, dist_buf, sizeof(dist_buf));
-      GRect dist_rect = GRect(tile.origin.x, tile.origin.y + tile.size.h - dist_h - 1,
+      GRect dist_rect = GRect(tile.origin.x, tile.origin.y + tile.size.h - dist_h - TEXT_EDGE_PADDING,
                                tile.size.w, dist_h);
       graphics_draw_text(ctx, dist_buf, dist_font, dist_rect,
                           GTextOverflowModeFill, GTextAlignmentCenter, NULL);
@@ -980,12 +986,12 @@ static void detail_graph_update_proc(Layer *layer, GContext *ctx) {
 
   format_minute_of_day(s_graph_minute_of_day[0], buf, sizeof(buf));
   graphics_draw_text(ctx, buf, fonts_get_system_font(FONT_KEY_GOTHIC_14),
-                      GRect(area.origin.x, bounds.origin.y + bounds.size.h - 14, 60, 14),
+                      GRect(area.origin.x, bounds.origin.y + bounds.size.h - 14 - TEXT_EDGE_PADDING, 60, 14),
                       GTextOverflowModeFill, GTextAlignmentLeft, NULL);
   format_minute_of_day(s_graph_minute_of_day[s_graph_count - 1], buf, sizeof(buf));
   graphics_draw_text(ctx, buf, fonts_get_system_font(FONT_KEY_GOTHIC_14),
                       GRect(area.origin.x + area.size.w - 50,
-                            bounds.origin.y + bounds.size.h - 14, 50, 14),
+                            bounds.origin.y + bounds.size.h - 14 - TEXT_EDGE_PADDING, 50, 14),
                       GTextOverflowModeFill, GTextAlignmentRight, NULL);
 }
 
