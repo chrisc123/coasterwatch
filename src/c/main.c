@@ -68,6 +68,9 @@
 #define SETTINGS_SORT_KEY    1
 #define SETTINGS_ALERTS_KEY  2
 #define SETTINGS_BANDS_KEY   3
+#define SETTINGS_CACHED_RIDES_COUNT_KEY 4
+#define SETTINGS_CACHED_RIDES_DATA_KEY  5
+#define SETTINGS_TOUCH_LOCK_KEY 6
 // queue-times.com updates its data every 5 minutes, so polling more often
 // than that just burns battery/network for no fresher data.
 #define REFRESH_INTERVAL_MS (5 * 60 * 1000)
@@ -134,7 +137,11 @@ static AppTimer    *s_refresh_timer;
 static GRect        s_scroll_frame; // the scroll layer's frame, in window/root-layer space
 #if PBL_API_EXISTS(tap_recognizer_create)
 static int16_t      s_pan_base;     // committed scroll offset.y during a drag
+static bool         s_pull_armed = false;
+static bool         s_pulling_down = false;
+static bool         s_touch_locked = false;
 #endif
+static bool         s_is_refreshing = false;
 
 static Window *s_detail_window;
 static Layer  *s_detail_header_layer;
@@ -180,7 +187,7 @@ static bool     s_phone_connected = false;
 static bool     s_show_error      = false;
 static SortMode s_sort_mode       = SORT_TIME;
 
-static char s_header_buf[40];
+static char s_header_buf[48];
 static char s_clock_buf[8];
 static char s_error_buf[48];
 
@@ -373,6 +380,22 @@ static void load_band_config(void) {
   }
 }
 
+static void save_cached_rides(void) {
+  if (s_ride_count > 0) {
+    persist_write_int(SETTINGS_CACHED_RIDES_COUNT_KEY, s_ride_count);
+    persist_write_data(SETTINGS_CACHED_RIDES_DATA_KEY, s_rides, sizeof(s_rides));
+  }
+}
+
+static void load_cached_rides(void) {
+  if (persist_exists(SETTINGS_CACHED_RIDES_COUNT_KEY) && persist_exists(SETTINGS_CACHED_RIDES_DATA_KEY)) {
+    s_ride_count = persist_read_int(SETTINGS_CACHED_RIDES_COUNT_KEY);
+    if (s_ride_count > MAX_RIDES) s_ride_count = MAX_RIDES;
+    persist_read_data(SETTINGS_CACHED_RIDES_DATA_KEY, s_rides, sizeof(s_rides));
+    recompute_order();
+  }
+}
+
 // Pebble apps can't invoke the watch's own system alert-vibe picker (that's
 // a user-facing OS setting, not an exposed API), so these are app-side
 // VibePattern durations. Three of them reproduce a real PebbleOS vibe score
@@ -483,8 +506,14 @@ static void refresh_timer_callback(void *data) {
   // hitting Bluetooth/AppMessage on the usual 5-minute tick regardless.
   BatteryChargeState battery = battery_state_service_peek();
   uint32_t interval = REFRESH_INTERVAL_MS;
-  if (!battery.is_charging && battery.charge_percent <= 20) {
-    interval = REFRESH_INTERVAL_MS * 3;
+  if (!battery.is_charging) {
+    if (battery.charge_percent <= 10) {
+      interval = REFRESH_INTERVAL_MS * 4; // 20 mins on critical battery
+    } else if (battery.charge_percent <= 20) {
+      interval = REFRESH_INTERVAL_MS * 3; // 15 mins on low battery
+    } else if (battery.charge_percent <= 30) {
+      interval = (REFRESH_INTERVAL_MS * 3) / 2; // 7.5 mins on moderate battery
+    }
   }
   s_refresh_timer = app_timer_register(interval, refresh_timer_callback, NULL);
 }
@@ -538,8 +567,17 @@ static void clock_tick_handler(struct tm *tick_time, TimeUnits units_changed) {
 }
 
 static void update_header(void) {
-  char status[24];
-  if (!s_phone_connected) {
+  char status[32];
+#if PBL_API_EXISTS(tap_recognizer_create)
+  if (s_pull_armed) {
+    snprintf(status, sizeof(status), "Release to refresh");
+  } else if (s_pulling_down) {
+    snprintf(status, sizeof(status), "Pull to refresh");
+  } else
+#endif
+  if (s_is_refreshing) {
+    snprintf(status, sizeof(status), "Refreshing...");
+  } else if (!s_phone_connected) {
     snprintf(status, sizeof(status), "No phone");
   } else if (s_ride_count == 0) {
     status[0] = '\0';
@@ -547,7 +585,19 @@ static void update_header(void) {
     const char *sort_name = "Time";
     if (s_sort_mode == SORT_DISTANCE) sort_name = "Distance";
     else if (s_sort_mode == SORT_ALERTS) sort_name = "Alerts";
+#if PBL_API_EXISTS(tap_recognizer_create)
+    if (s_touch_locked) {
+#if defined(PBL_ROUND)
+      snprintf(status, sizeof(status), "[LOCK] %s", sort_name);
+#else
+      snprintf(status, sizeof(status), "%s", sort_name);
+#endif
+    } else {
+      snprintf(status, sizeof(status), "Sort: %s", sort_name);
+    }
+#else
     snprintf(status, sizeof(status), "Sort: %s", sort_name);
+#endif
   }
 
   if (s_clock_layer) {
@@ -587,6 +637,31 @@ static void header_update_proc(Layer *layer, GContext *ctx) {
   graphics_context_set_fill_color(ctx, GColorBlack);
   graphics_fill_rect(ctx, bounds, 0, GCornerNone);
   graphics_context_set_text_color(ctx, GColorWhite);
+
+#if PBL_API_EXISTS(tap_recognizer_create)
+  if (s_touch_locked) {
+    // 1. Draw centered [LOCK] across the full screen width
+    int screen_w = bounds.size.w + HEADER_CLOCK_WIDTH;
+    int center_x = (screen_w / 2) - HEADER_CLOCK_WIDTH;
+    GSize lock_size = graphics_text_layout_get_content_size("[LOCK]", font, bounds,
+                                                            GTextOverflowModeFill, GTextAlignmentLeft);
+    int lock_x = center_x - (lock_size.w / 2);
+    int lock_y = (bounds.size.h - lock_size.h) / 2;
+    graphics_draw_text(ctx, "[LOCK]", font, GRect(lock_x, lock_y, lock_size.w, lock_size.h),
+                       GTextOverflowModeFill, GTextAlignmentCenter, NULL);
+
+    // 2. Draw right-aligned sort mode
+    align = GTextAlignmentRight;
+    text_bounds = GRect(bounds.origin.x, bounds.origin.y, bounds.size.w - TILE_PAD, bounds.size.h);
+    GSize content = graphics_text_layout_get_content_size(s_header_buf, font, text_bounds,
+                                                           GTextOverflowModeFill, align);
+    int y = (bounds.size.h - content.h) / 2;
+    graphics_draw_text(ctx, s_header_buf, font, GRect(text_bounds.origin.x, y, text_bounds.size.w, content.h),
+                       GTextOverflowModeFill, align, NULL);
+    return;
+  }
+#endif
+
   align = GTextAlignmentRight;
   text_bounds = GRect(bounds.origin.x, bounds.origin.y, bounds.size.w - TILE_PAD, bounds.size.h);
 #endif
@@ -981,11 +1056,33 @@ static void select_long_click_handler(ClickRecognizerRef recognizer, void *conte
   cycle_sort_mode();
 }
 
+#if PBL_API_EXISTS(tap_recognizer_create)
+static void reset_pull_position(bool animated);
+
+static void select_double_click_handler(ClickRecognizerRef recognizer, void *context) {
+  s_touch_locked = !s_touch_locked;
+#if PBL_API_EXISTS(app_touch_navigation_enable)
+  app_touch_navigation_enable(!s_touch_locked);
+#endif
+  if (s_touch_locked) {
+    vibes_double_pulse();
+    reset_pull_position(false);
+  } else {
+    vibes_short_pulse();
+  }
+  update_header();
+  persist_write_bool(SETTINGS_TOUCH_LOCK_KEY, s_touch_locked);
+}
+#endif
+
 static void click_config_provider(void *context) {
   window_single_click_subscribe(BUTTON_ID_UP, up_click_handler);
   window_single_click_subscribe(BUTTON_ID_DOWN, down_click_handler);
   window_single_click_subscribe(BUTTON_ID_SELECT, select_click_handler);
   window_long_click_subscribe(BUTTON_ID_SELECT, 500, select_long_click_handler, NULL);
+#if PBL_API_EXISTS(tap_recognizer_create)
+  window_multi_click_subscribe(BUTTON_ID_SELECT, 2, 0, 0, true, select_double_click_handler);
+#endif
 }
 
 // --- Touch (Pebble Time 2 / Round 2 only) ----------------------------------
@@ -1001,8 +1098,23 @@ static bool always_simultaneous(const Recognizer *recognizer, const Recognizer *
 }
 
 static void main_tap_handler(const Recognizer *recognizer, RecognizerEvent event) {
+  if (s_touch_locked) return;
   if (event != RecognizerEvent_Completed) return;
   GPoint p = tap_recognizer_get_tap_point(recognizer);
+
+  // Tapping the top header bar cycles sort mode
+  if (p.y < s_scroll_frame.origin.y) {
+    vibes_short_pulse();
+    s_sort_mode = (s_sort_mode == SORT_TIME) ? SORT_DISTANCE :
+                  (s_sort_mode == SORT_DISTANCE) ? SORT_ALERTS : SORT_TIME;
+    persist_write_int(SETTINGS_SORT_KEY, (int)s_sort_mode);
+    recompute_order();
+    update_header();
+    update_grid_layout();
+    layer_mark_dirty(s_grid_content_layer);
+    return;
+  }
+
   int order_pos;
   if (hit_test_tile(p, &order_pos)) {
     vibes_short_pulse();
@@ -1014,22 +1126,166 @@ static void main_tap_handler(const Recognizer *recognizer, RecognizerEvent event
   }
 }
 
-// Vertical drag scrolls the list. Pattern per the SDK's own ScrollLayer +
-// pan-recognizer example: a bare ScrollLayer doesn't scroll by touch on its
-// own, so this drives it manually from a pan recognizer's delta.
+#define PULL_TO_REFRESH_THRESHOLD 44
+
+static PropertyAnimation *s_bounce_anim = NULL;
+static Layer             *s_pull_indicator_layer = NULL;
+
+static void pull_indicator_update_proc(Layer *layer, GContext *ctx) {
+  GRect bounds = layer_get_bounds(layer);
+  int pull_y = layer_get_frame(s_grid_content_layer).origin.y;
+  if (pull_y < 8) return;
+
+  GPoint center = GPoint(bounds.size.w / 2, pull_y / 2);
+  int pull_degrees = (pull_y * 330) / PULL_TO_REFRESH_THRESHOLD;
+  if (pull_degrees > 330) pull_degrees = 330;
+  if (pull_degrees < 20) pull_degrees = 20;
+
+  GColor stroke_color = s_pull_armed ?
+      PBL_IF_COLOR_ELSE(GColorCobaltBlue, GColorBlack) :
+      PBL_IF_COLOR_ELSE(GColorDarkGray, GColorBlack);
+
+  graphics_context_set_stroke_color(ctx, stroke_color);
+  graphics_context_set_fill_color(ctx, stroke_color);
+  graphics_context_set_stroke_width(ctx, 2);
+
+  GRect arc_rect = GRect(center.x - 8, center.y - 8, 16, 16);
+  int32_t end_trig = DEG_TO_TRIGANGLE(pull_degrees);
+  graphics_draw_arc(ctx, arc_rect, GOvalScaleModeFitCircle, DEG_TO_TRIGANGLE(0), end_trig);
+
+  // Draw arrow head marker at the advancing tip of the circle
+  int tip_x = center.x + (sin_lookup(end_trig) * 8) / TRIG_MAX_RATIO;
+  int tip_y = center.y - (cos_lookup(end_trig) * 8) / TRIG_MAX_RATIO;
+  graphics_fill_circle(ctx, GPoint(tip_x, tip_y), 2);
+}
+
+static void reset_pull_position(bool animated) {
+  GridMetrics m = compute_grid_metrics();
+  GRect start_frame = layer_get_frame(s_grid_content_layer);
+  GRect end_frame = GRect(0, 0, m.w, m.content_h);
+
+  if (s_bounce_anim) {
+    animation_unschedule((Animation *)s_bounce_anim);
+    s_bounce_anim = NULL;
+  }
+
+  if (s_pull_indicator_layer) layer_mark_dirty(s_pull_indicator_layer);
+
+  if (!animated || start_frame.origin.y == 0) {
+    layer_set_frame(s_grid_content_layer, end_frame);
+    return;
+  }
+
+  s_bounce_anim = property_animation_create_layer_frame(s_grid_content_layer, &start_frame, &end_frame);
+  animation_set_duration((Animation *)s_bounce_anim, 220);
+  animation_set_curve((Animation *)s_bounce_anim, AnimationCurveEaseOut);
+  animation_schedule((Animation *)s_bounce_anim);
+}
+
+// Vertical drag & flick scrolls the list smoothly.
+// Directly shifts the content layer frame on downward pull for visible elastic stretching and bounce.
 static void main_pan_handler(const Recognizer *recognizer, RecognizerEvent event) {
+  if (s_touch_locked) return;
+  GridMetrics m = compute_grid_metrics();
+  int min_y = (m.content_h > s_scroll_frame.size.h) ? -(m.content_h - s_scroll_frame.size.h) : 0;
+
   switch (event) {
+    case RecognizerEvent_Started:
+      if (s_bounce_anim) {
+        animation_unschedule((Animation *)s_bounce_anim);
+        s_bounce_anim = NULL;
+      }
+      s_pan_base = scroll_layer_get_content_offset(s_scroll_layer).y;
+      s_pull_armed = false;
+      s_pulling_down = false;
+      break;
+
     case RecognizerEvent_Updated: {
       GPoint d = pan_recognizer_get_delta_since_start(recognizer);
-      scroll_layer_set_content_offset(s_scroll_layer, GPoint(0, s_pan_base + d.y), false);
+
+      // Handle pull-down elastic stretching when dragging downward at top of list
+      if (s_pan_base >= 0 && d.y > 0) {
+        scroll_layer_set_content_offset(s_scroll_layer, GPoint(0, 0), false);
+        int pull_y = (d.y * 2) / 3;
+        if (pull_y > 60) pull_y = 60;
+
+        layer_set_frame(s_grid_content_layer, GRect(0, pull_y, m.w, m.content_h));
+
+        bool was_armed = s_pull_armed;
+        s_pull_armed = (pull_y >= PULL_TO_REFRESH_THRESHOLD);
+        s_pulling_down = (pull_y > 8);
+
+        if (s_pull_armed && !was_armed) {
+          vibes_short_pulse();
+        }
+        if (s_pull_indicator_layer) layer_mark_dirty(s_pull_indicator_layer);
+        update_header();
+      } else {
+        if (layer_get_frame(s_grid_content_layer).origin.y != 0) {
+          reset_pull_position(false);
+        }
+        if (s_pull_armed || s_pulling_down) {
+          s_pull_armed = false;
+          s_pulling_down = false;
+          update_header();
+        }
+        int target_y = s_pan_base + d.y;
+        scroll_layer_set_content_offset(s_scroll_layer, GPoint(0, target_y), false);
+      }
       break;
     }
-    case RecognizerEvent_Completed:
-      s_pan_base = scroll_layer_get_content_offset(s_scroll_layer).y;
+
+    case RecognizerEvent_Completed: {
+      if (s_pull_armed) {
+        s_pull_armed = false;
+        s_pulling_down = false;
+        s_is_refreshing = true;
+        update_header();
+        vibes_short_pulse();
+        request_refresh();
+        reset_pull_position(true);
+        s_pan_base = 0;
+      } else if (layer_get_frame(s_grid_content_layer).origin.y > 0) {
+        s_pull_armed = false;
+        s_pulling_down = false;
+        update_header();
+        reset_pull_position(true);
+        s_pan_base = 0;
+      } else {
+        int cur_y = scroll_layer_get_content_offset(s_scroll_layer).y;
+        GPoint v = pan_recognizer_get_velocity(recognizer);
+
+        if (cur_y < min_y) {
+          scroll_layer_set_content_offset(s_scroll_layer, GPoint(0, min_y), true);
+          s_pan_base = min_y;
+        } else if (v.y > 250 || v.y < -250) {
+          int target_y = cur_y + (v.y * 3) / 5;
+          if (target_y > 0) target_y = 0;
+          if (target_y < min_y) target_y = min_y;
+          scroll_layer_set_content_offset(s_scroll_layer, GPoint(0, target_y), true);
+          s_pan_base = target_y;
+        } else {
+          s_pan_base = cur_y;
+        }
+      }
       break;
-    case RecognizerEvent_Cancelled:
-      scroll_layer_set_content_offset(s_scroll_layer, GPoint(0, s_pan_base), true);
+    }
+
+    case RecognizerEvent_Cancelled: {
+      s_pull_armed = false;
+      s_pulling_down = false;
+      update_header();
+      reset_pull_position(true);
+      int cur_y = scroll_layer_get_content_offset(s_scroll_layer).y;
+      if (cur_y < min_y) {
+        scroll_layer_set_content_offset(s_scroll_layer, GPoint(0, min_y), true);
+        s_pan_base = min_y;
+      } else {
+        s_pan_base = cur_y;
+      }
       break;
+    }
+
     default:
       break;
   }
@@ -1058,6 +1314,14 @@ static void detail_header_update_proc(Layer *layer, GContext *ctx) {
   draw_vcentered_text(ctx, s_detail_header_buf, font, bounds, GTextOverflowModeFill);
 }
 
+static void draw_dotted_h_line(GContext *ctx, int x_start, int x_end, int y, GColor color) {
+  graphics_context_set_stroke_color(ctx, color);
+  for (int x = x_start; x <= x_end; x += 4) {
+    int xe = (x + 1 <= x_end) ? x + 1 : x_end;
+    graphics_draw_line(ctx, GPoint(x, y), GPoint(xe, y));
+  }
+}
+
 static void detail_graph_update_proc(Layer *layer, GContext *ctx) {
   GRect bounds = layer_get_bounds(layer);
 
@@ -1076,9 +1340,15 @@ static void detail_graph_update_proc(Layer *layer, GContext *ctx) {
     return;
   }
 
-  int margin = 6;
-  GRect area = GRect(bounds.origin.x + margin + 26, bounds.origin.y + margin,
-                      bounds.size.w - 2 * margin - 26, bounds.size.h - 2 * margin - 14);
+  int margin = 4;
+  int gutter = 26;
+  int top_headroom = 6;
+  int bottom_time_h = 14 + TEXT_EDGE_PADDING;
+  GRect area = GRect(bounds.origin.x + margin + gutter,
+                     bounds.origin.y + margin + top_headroom,
+                     bounds.size.w - 2 * margin - gutter,
+                     bounds.size.h - 2 * margin - bottom_time_h - top_headroom);
+  int baseline_y = area.origin.y + area.size.h;
 
   int16_t max_w = 10; // minimum scale span so a flat line isn't full-height
   for (int i = 0; i < s_graph_count; i++) {
@@ -1092,15 +1362,63 @@ static void detail_graph_update_proc(Layer *layer, GContext *ctx) {
   bool show_threshold = alert && alert->enabled;
   if (show_threshold && alert->threshold_min > max_w) max_w = alert->threshold_min;
 
+  // 1. Reference Gridlines (subtle 1px dotted)
+  GColor grid_color = PBL_IF_COLOR_ELSE(GColorLightGray, GColorBlack);
+  // Baseline (0m) line
+  draw_dotted_h_line(ctx, area.origin.x, area.origin.x + area.size.w, baseline_y, grid_color);
+  // Top ceiling (max_w) line
+  draw_dotted_h_line(ctx, area.origin.x, area.origin.x + area.size.w, area.origin.y, grid_color);
+
+  // 5-minute aligned benchmark gridline (e.g. 15m or 30m when scale has enough vertical room)
+  int benchmark_wait = 0;
+  if (max_w >= 50) benchmark_wait = 30;
+  else if (max_w >= 25) benchmark_wait = 15;
+
+  if (benchmark_wait > 0 && benchmark_wait < max_w) {
+    int bench_y = area.origin.y + area.size.h - (area.size.h * benchmark_wait) / max_w;
+    draw_dotted_h_line(ctx, area.origin.x, area.origin.x + area.size.w, bench_y, grid_color);
+
+    char bench_buf[10];
+    snprintf(bench_buf, sizeof(bench_buf), "%dm", benchmark_wait);
+    graphics_context_set_text_color(ctx, PBL_IF_COLOR_ELSE(GColorDarkGray, GColorBlack));
+    graphics_draw_text(ctx, bench_buf, fonts_get_system_font(FONT_KEY_GOTHIC_14),
+                       GRect(bounds.origin.x, bench_y - 7, 28, 14),
+                       GTextOverflowModeFill, GTextAlignmentLeft, NULL);
+  }
+
+#if defined(PBL_COLOR)
+  // 2. Subtle 50% dither / pin-stripe area fill under the curve down to baseline
+  graphics_context_set_stroke_color(ctx, GColorBabyBlueEyes);
+  for (int i = 0; i < s_graph_count - 1; i++) {
+    bool gapped = (s_graph_minute_of_day[i + 1] - s_graph_minute_of_day[i] > GRAPH_GAP_MINUTES);
+    if (gapped) continue;
+
+    int x1 = (s_graph_count == 1) ? area.origin.x
+                                  : area.origin.x + (area.size.w * i) / (s_graph_count - 1);
+    int x2 = area.origin.x + (area.size.w * (i + 1)) / (s_graph_count - 1);
+    int w1 = s_graph_points[i] < 0 ? 0 : s_graph_points[i];
+    int w2 = s_graph_points[i + 1] < 0 ? 0 : s_graph_points[i + 1];
+    int y1 = area.origin.y + area.size.h - (area.size.h * w1) / max_w;
+    int y2 = area.origin.y + area.size.h - (area.size.h * w2) / max_w;
+
+    int dx = x2 - x1;
+    if (dx <= 0) continue;
+
+    for (int x = x1; x <= x2; x++) {
+      if (x % 2 == 0) { // Alternating 1px vertical pin-stripe
+        int seg_y = y1 + (y2 - y1) * (x - x1) / dx;
+        if (seg_y < baseline_y) {
+          graphics_draw_line(ctx, GPoint(x, seg_y), GPoint(x, baseline_y - 1));
+        }
+      }
+    }
+  }
+#endif
+
+  // 3. Alert Threshold Line (drawn ON TOP of area fill)
   if (show_threshold) {
     int threshold_y = area.origin.y + area.size.h -
                        (area.size.h * alert->threshold_min) / max_w;
-    // Same state-based coloring as the alert band below: vivid cerulean
-    // while armed-but-waiting, the alert-met color once the wait actually
-    // reaches it — one consistent signal, not a fixed color. B/W platforms
-    // override to always-black: alert_band_colors()'s "armed" B/W fallback
-    // is white, correct for a filled tile background, but invisible for a
-    // thin line against this graph's white background.
     GColor line_color;
 #if defined(PBL_COLOR)
     GColor unused_text;
@@ -1119,17 +1437,11 @@ static void detail_graph_update_proc(Layer *layer, GContext *ctx) {
     graphics_context_set_stroke_width(ctx, 1);
   }
 
-  // Points are spaced evenly by index, not by elapsed clock time: a real
-  // gap (Bluetooth dropped, app was closed a while) would otherwise stretch
-  // the axis to cover the dead stretch and squeeze every other point into a
-  // sliver — index spacing costs nothing when there's no gap, and never
-  // wastes space when there is one. A big gap is instead marked by skipping
-  // the connecting *line* into that point (its dot still draws), so it
-  // reads as "these two are separated in time" rather than a smooth
-  // transition that implies data which was never actually recorded.
+  // 4. Main Curve Line & Data Points (drawn ON TOP)
   GPoint prev = GPointZero;
   bool has_prev = false;
   int prev_minute = 0;
+  GColor curve_color = PBL_IF_COLOR_ELSE(GColorCobaltBlue, GColorBlack);
   for (int i = 0; i < s_graph_count; i++) {
     int x = (s_graph_count == 1) ? area.origin.x
                                   : area.origin.x + (area.size.w * i) / (s_graph_count - 1);
@@ -1138,11 +1450,11 @@ static void detail_graph_update_proc(Layer *layer, GContext *ctx) {
     GPoint p = GPoint(x, y);
     bool gapped = has_prev && (s_graph_minute_of_day[i] - prev_minute > GRAPH_GAP_MINUTES);
     if (has_prev && !gapped) {
-      graphics_context_set_stroke_color(ctx, GColorBlue);
+      graphics_context_set_stroke_color(ctx, curve_color);
       graphics_context_set_stroke_width(ctx, 2);
       graphics_draw_line(ctx, prev, p);
     }
-    graphics_context_set_fill_color(ctx, GColorBlue);
+    graphics_context_set_fill_color(ctx, curve_color);
     graphics_fill_circle(ctx, p, 2);
     prev = p;
     prev_minute = s_graph_minute_of_day[i];
@@ -1150,14 +1462,15 @@ static void detail_graph_update_proc(Layer *layer, GContext *ctx) {
   }
   graphics_context_set_stroke_width(ctx, 1);
 
+  // 5. Y-Axis & X-Axis Labels
   char buf[10];
   graphics_context_set_text_color(ctx, GColorBlack);
   snprintf(buf, sizeof(buf), "%dm", max_w);
   graphics_draw_text(ctx, buf, fonts_get_system_font(FONT_KEY_GOTHIC_14),
-                      GRect(bounds.origin.x, area.origin.y - 2, 28, 14),
+                      GRect(bounds.origin.x, area.origin.y - 7, 28, 14),
                       GTextOverflowModeFill, GTextAlignmentLeft, NULL);
   graphics_draw_text(ctx, "0m", fonts_get_system_font(FONT_KEY_GOTHIC_14),
-                      GRect(bounds.origin.x, area.origin.y + area.size.h - 12, 28, 14),
+                      GRect(bounds.origin.x, baseline_y - 7, 28, 14),
                       GTextOverflowModeFill, GTextAlignmentLeft, NULL);
 
   format_minute_of_day(s_graph_minute_of_day[0], buf, sizeof(buf));
@@ -1284,10 +1597,14 @@ static void detail_click_config_provider(void *context) {
   window_single_repeating_click_subscribe(BUTTON_ID_UP, 200, detail_up_click_handler);
   window_single_repeating_click_subscribe(BUTTON_ID_DOWN, 200, detail_down_click_handler);
   window_single_click_subscribe(BUTTON_ID_SELECT, detail_select_click_handler);
+#if PBL_API_EXISTS(tap_recognizer_create)
+  window_multi_click_subscribe(BUTTON_ID_SELECT, 2, 0, 0, true, select_double_click_handler);
+#endif
 }
 
 #if PBL_API_EXISTS(tap_recognizer_create)
 static void detail_tap_handler(const Recognizer *recognizer, RecognizerEvent event) {
+  if (s_touch_locked) return;
   if (event != RecognizerEvent_Completed) return;
   GPoint p = tap_recognizer_get_tap_point(recognizer);
   GRect band_frame = layer_get_frame(s_detail_alert_layer); // window-space
@@ -1296,6 +1613,7 @@ static void detail_tap_handler(const Recognizer *recognizer, RecognizerEvent eve
     GPoint local = GPoint(p.x - band_frame.origin.x, p.y - band_frame.origin.y);
     GRect minus_rect, plus_rect;
     alert_band_layout(GRect(0, 0, band_frame.size.w, band_frame.size.h), &minus_rect, &plus_rect);
+    vibes_short_pulse();
     if (local.x >= minus_rect.origin.x && local.x < minus_rect.origin.x + minus_rect.size.w) {
       adjust_alert_threshold(-ALERT_STEP_MINUTES);
     } else if (local.x >= plus_rect.origin.x && local.x < plus_rect.origin.x + plus_rect.size.w) {
@@ -1311,6 +1629,7 @@ static void detail_tap_handler(const Recognizer *recognizer, RecognizerEvent eve
 // Either horizontal direction closes — permissive on purpose, since this
 // window has no other use for a horizontal swipe to compete with.
 static void detail_swipe_handler(const Recognizer *recognizer, RecognizerEvent event) {
+  if (s_touch_locked) return;
   if (event != RecognizerEvent_Completed) return;
   window_stack_pop(true);
 }
@@ -1376,6 +1695,7 @@ static void detail_window_unload(Window *window) {
   window_destroy(window);
   s_detail_window = NULL;
   s_detail_ride_id = -1;
+  if (s_grid_content_layer) layer_mark_dirty(s_grid_content_layer);
 }
 
 static void open_detail_window(void) {
@@ -1406,6 +1726,59 @@ static void open_detail_window(void) {
 // AppMessage receiving
 
 static void inbox_received_callback(DictionaryIterator *iter, void *context) {
+  Tuple *t_rides_data = dict_find(iter, MESSAGE_KEY_RidesData);
+  if (t_rides_data && t_rides_data->type == TUPLE_BYTE_ARRAY) {
+    const uint8_t *bytes = t_rides_data->value->data;
+    uint32_t len = t_rides_data->length;
+    if (len >= 1) {
+      int count = bytes[0];
+      if (count > MAX_RIDES) count = MAX_RIDES;
+      uint32_t offset = 1;
+      int valid_rides = 0;
+      for (int i = 0; i < count && offset < len; i++) {
+        if (offset + 11 > len) break;
+        int32_t id = (int32_t)(((uint32_t)bytes[offset] << 24) | ((uint32_t)bytes[offset + 1] << 16) | ((uint32_t)bytes[offset + 2] << 8) | (uint32_t)bytes[offset + 3]);
+        offset += 4;
+        int16_t wait = (int16_t)(((uint16_t)bytes[offset] << 8) | (uint16_t)bytes[offset + 1]);
+        offset += 2;
+        int32_t dist = (int32_t)(((uint32_t)bytes[offset] << 24) | ((uint32_t)bytes[offset + 1] << 16) | ((uint32_t)bytes[offset + 2] << 8) | (uint32_t)bytes[offset + 3]);
+        offset += 4;
+        uint8_t name_len = bytes[offset++];
+        if (offset + name_len > len) break;
+
+        s_rides[i].ride_id = id;
+        s_rides[i].wait_minutes = wait;
+        s_rides[i].distance_m = dist;
+        uint8_t copy_len = name_len < (NAME_BUF_LEN - 1) ? name_len : (NAME_BUF_LEN - 1);
+        memcpy(s_rides[i].name, &bytes[offset], copy_len);
+        s_rides[i].name[copy_len] = '\0';
+        offset += name_len;
+        valid_rides++;
+
+        if (s_rides[i].ride_id == s_detail_ride_id) {
+          s_detail_wait = s_rides[i].wait_minutes;
+          update_detail_header();
+          if (s_detail_alert_layer) layer_mark_dirty(s_detail_alert_layer);
+          if (s_detail_graph_layer) layer_mark_dirty(s_detail_graph_layer);
+        }
+        check_alert_for_ride(s_rides[i].ride_id, s_rides[i].wait_minutes);
+      }
+
+      s_ride_count = valid_rides;
+      s_pending_total = 0;
+      s_show_error = false;
+      s_is_refreshing = false;
+      recompute_order();
+      update_grid_layout();
+      update_header();
+      if (window_stack_get_top_window() == s_main_window) {
+        layer_mark_dirty(s_grid_content_layer);
+      }
+      save_cached_rides();
+    }
+    return;
+  }
+
   Tuple *t_total = dict_find(iter, MESSAGE_KEY_TotalCount);
   if (t_total) {
     // Deliberately does NOT reset s_ride_count/s_cursor here: the current
@@ -1475,7 +1848,27 @@ static void inbox_received_callback(DictionaryIterator *iter, void *context) {
       s_show_error = true;
       layer_mark_dirty(s_grid_content_layer);
     }
+    s_is_refreshing = false;
+    update_header();
     APP_LOG(APP_LOG_LEVEL_ERROR, "CoasterWatch error: %s", t_err->value->cstring);
+    return;
+  }
+
+  Tuple *t_gdata = dict_find(iter, MESSAGE_KEY_GraphData);
+  if (t_gdata) {
+    int total_points = t_gdata->length / 3;
+    if (total_points > MAX_GRAPH_POINTS) total_points = MAX_GRAPH_POINTS;
+    const uint8_t *bytes = t_gdata->value->data;
+    for (int i = 0; i < total_points; i++) {
+      uint8_t w = bytes[i * 3];
+      s_graph_points[i] = (w == 255) ? -1 : (int16_t)w;
+      s_graph_minute_of_day[i] = (int16_t)((bytes[i * 3 + 1] << 8) | bytes[i * 3 + 2]);
+    }
+    s_graph_count = total_points;
+    s_graph_expected_count = total_points;
+    s_graph_loading = false;
+    s_graph_show_error = false;
+    if (s_detail_graph_layer) layer_mark_dirty(s_detail_graph_layer);
     return;
   }
 
@@ -1649,6 +2042,13 @@ static void main_window_load(Window *window) {
 
   s_scroll_layer = scroll_layer_create(s_scroll_frame);
   scroll_layer_set_shadow_hidden(s_scroll_layer, true);
+
+#if PBL_API_EXISTS(tap_recognizer_create)
+  s_pull_indicator_layer = layer_create(GRect(0, 0, s_scroll_frame.size.w, 70));
+  layer_set_update_proc(s_pull_indicator_layer, pull_indicator_update_proc);
+  scroll_layer_add_child(s_scroll_layer, s_pull_indicator_layer);
+#endif
+
   s_grid_content_layer = layer_create(GRect(0, 0, s_scroll_frame.size.w, s_scroll_frame.size.h));
   layer_set_update_proc(s_grid_content_layer, grid_update_proc);
   scroll_layer_add_child(s_scroll_layer, s_grid_content_layer);
@@ -1667,14 +2067,6 @@ static void main_window_load(Window *window) {
   // our own recognizers just handled.
   Recognizer *tap = tap_recognizer_create(main_tap_handler, NULL);
   Recognizer *pan = pan_recognizer_create(main_pan_handler, NULL, PanAxis_Vertical);
-  // Tap and pan compete for the same touch-down by default. fail_after
-  // (pan waits for tap to fail) turned out to stall tap's own resolution
-  // entirely — plausibly because pan just sits in "possible" for a
-  // stationary touch instead of cleanly failing, so tap never got told it
-  // could complete. Evaluating them simultaneously instead lets each
-  // resolve independently: a stationary touch satisfies tap and never
-  // crosses pan's movement threshold; a real drag fails tap's "no
-  // movement" criterion while pan proceeds.
   recognizer_set_simultaneous_with(tap, always_simultaneous);
   recognizer_set_simultaneous_with(pan, always_simultaneous);
   window_attach_recognizer(window, tap);
@@ -1687,6 +2079,13 @@ static void main_window_load(Window *window) {
 
 static void main_window_unload(Window *window) {
   tick_timer_service_unsubscribe();
+#if PBL_API_EXISTS(tap_recognizer_create)
+  if (s_bounce_anim) {
+    animation_unschedule((Animation *)s_bounce_anim);
+    s_bounce_anim = NULL;
+  }
+  if (s_pull_indicator_layer) layer_destroy(s_pull_indicator_layer);
+#endif
   layer_destroy(s_grid_content_layer);
   scroll_layer_destroy(s_scroll_layer);
   layer_destroy(s_header_layer);
@@ -1699,6 +2098,12 @@ static void init(void) {
   }
   load_alerts();
   load_band_config();
+  load_cached_rides();
+#if PBL_API_EXISTS(tap_recognizer_create)
+  if (persist_exists(SETTINGS_TOUCH_LOCK_KEY)) {
+    s_touch_locked = persist_read_bool(SETTINGS_TOUCH_LOCK_KEY);
+  }
+#endif
 
 #ifdef PBL_COLOR
   s_ride_name_font = fonts_load_custom_font(resource_get_handle(RESOURCE_ID_RIDE_NAME_FONT_16));
@@ -1708,7 +2113,7 @@ static void init(void) {
   // Third-party apps are opt-out of touch by default; without this call it's
   // unclear from the SDK docs whether even our own recognizers receive
   // anything. Harmless to call unconditionally on touch-capable hardware.
-  app_touch_navigation_enable(true);
+  app_touch_navigation_enable(!s_touch_locked);
 #endif
 
   s_main_window = window_create();

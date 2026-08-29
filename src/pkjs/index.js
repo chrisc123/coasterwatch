@@ -315,7 +315,7 @@ function getLocation(cb) {
     done = true;
     clearTimeout(timer);
     cb(null);
-  }, { timeout: 7000, maximumAge: 60000 });
+  }, { timeout: 7000, maximumAge: 300000 });
 }
 
 function haversineMeters(lat1, lng1, lat2, lng2) {
@@ -513,76 +513,86 @@ function getGraphPoints(rideId) {
 // would keep writing the *old park's* rides into the new list's indices.
 // The retry path especially needs this: it re-fires on a 500ms timer for
 // as long as sends keep failing, with no other bound.
-var rideStreamSeq = 0;
+// Packs the ride roster into a single compact binary payload (RidesData key)
+// and sends it in ONE AppMessage packet, eliminating 20+ sequential Bluetooth
+// round-trips that took 2-3 seconds.
+// Format:
+//   Byte 0: ride_count (N <= 40)
+//   For each ride:
+//     4 bytes: ride_id (int32 big-endian)
+//     2 bytes: wait_minutes (int16 big-endian, -1 for closed)
+//     4 bytes: distance_m (int32 big-endian, -1 for unknown)
+//     1 byte:  name_length (L)
+//     L bytes: UTF-8 name characters
+var s_last_sent_rides_bytes = null;
 
-function sendNext(i, rides, seq) {
-  if (seq !== rideStreamSeq) return;
-  if (i >= rides.length) return;
-  var r = rides[i];
-  var dict = {
-    'RideIndex': i,
-    'RideId': r.id,
-    'RideName': cleanName(r.name),
-    'RideWait': r.is_open ? r.wait_time : -1,
-    'RideDistance': (r._distance !== undefined) ? r._distance : -1
-  };
-  Pebble.sendAppMessage(dict, function () {
-    sendNext(i + 1, rides, seq);
-  }, function () {
-    if (seq !== rideStreamSeq) return;
-    console.log('CoasterWatch: send failed for ride ' + i + ', retrying');
-    setTimeout(function () { sendNext(i, rides, seq); }, 500);
-  });
+function arraysEqual(a, b) {
+  if (!a || !b || a.length !== b.length) return false;
+  for (var i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
 }
 
-function sendRidesToWatch(rides) {
-  rideStreamSeq++;
-  var seq = rideStreamSeq;
+function sendRidesToWatch(rides, forceSend) {
   var capped = rides.slice(0, MAX_RIDES);
-  Pebble.sendAppMessage({ 'TotalCount': capped.length }, function () {
-    sendNext(0, capped, seq);
-  }, function () {
-    console.log('CoasterWatch: failed to send TotalCount');
+  var bytes = [capped.length];
+  for (var i = 0; i < capped.length; i++) {
+    var r = capped[i];
+    var id = r.id;
+    bytes.push((id >> 24) & 0xFF, (id >> 16) & 0xFF, (id >> 8) & 0xFF, id & 0xFF);
+    var w = r.is_open ? r.wait_time : -1;
+    bytes.push((w >> 8) & 0xFF, w & 0xFF);
+    var d = (r._distance !== undefined) ? r._distance : -1;
+    bytes.push((d >> 24) & 0xFF, (d >> 16) & 0xFF, (d >> 8) & 0xFF, d & 0xFF);
+    var nameStr = cleanName(r.name);
+    var utf8Name = unescape(encodeURIComponent(nameStr));
+    bytes.push(utf8Name.length);
+    for (var k = 0; k < utf8Name.length; k++) {
+      bytes.push(utf8Name.charCodeAt(k));
+    }
+  }
+
+  // Battery saver: skip transmitting over Bluetooth if data has not changed
+  if (!forceSend && s_last_sent_rides_bytes && arraysEqual(bytes, s_last_sent_rides_bytes)) {
+    console.log('CoasterWatch: Queue data unchanged, skipped redundant Bluetooth sync');
+    return bytes;
+  }
+  s_last_sent_rides_bytes = bytes;
+
+  Pebble.sendAppMessage({ 'RidesData': bytes }, function () {}, function () {
+    console.log('CoasterWatch: failed to send RidesData');
   });
+  return bytes;
 }
 
 function sendError(msg) {
   Pebble.sendAppMessage({ 'ErrorMsg': msg.substring(0, 40) });
 }
 
-// Bumped by every sendGraph() call and captured by its own point-sending
-// chain (sendGraphPoint's `seq` param) — if the user opens another ride's
-// detail view before the previous one's points finished streaming, the
-// stale chain's `seq` no longer matches and it quietly stops instead of
-// interleaving its remaining points with the new ride's stream.
-var graphRequestSeq = 0;
-
-function sendGraphPoint(i, points, seq) {
-  if (seq !== graphRequestSeq) return;
-  if (i >= points.length) return;
-  var p = points[i];
-  var dict = { 'GraphIndex': i, 'GraphWait': p.wait, 'GraphMinuteOfDay': p.minuteOfDay };
-  Pebble.sendAppMessage(dict, function () {
-    sendGraphPoint(i + 1, points, seq);
-  }, function () {
-    if (seq !== graphRequestSeq) return;
-    setTimeout(function () { sendGraphPoint(i, points, seq); }, 300);
-  });
-}
-
+// Packs all points into a single compact binary byte array and sends it in ONE
+// AppMessage transaction (GraphData key), replacing the old 25-message serial
+// stream that took 2.5-3.5 seconds over Bluetooth LE.
+// Format per point (3 bytes):
+//   Byte 0: wait_time (0..250, or 255 for -1/closed)
+//   Byte 1: minute_of_day >> 8 (high byte)
+//   Byte 2: minute_of_day & 0xFF (low byte)
 function sendGraph(rideId) {
-  graphRequestSeq++;
-  var seq = graphRequestSeq;
   var points = getGraphPoints(rideId);
-  if (!points) {
+  if (!points || points.length === 0) {
     Pebble.sendAppMessage({ 'GraphError': 'Not enough data recorded yet today' });
     return;
   }
-  var dict = { 'GraphCount': points.length };
-  Pebble.sendAppMessage(dict, function () {
-    sendGraphPoint(0, points, seq);
-  }, function () {
-    console.log('CoasterWatch: failed to send GraphCount');
+  var bytes = [];
+  for (var i = 0; i < points.length; i++) {
+    var p = points[i];
+    var w = (p.wait < 0) ? 255 : (p.wait > 250 ? 250 : p.wait);
+    bytes.push(w);
+    bytes.push((p.minuteOfDay >> 8) & 0xFF);
+    bytes.push(p.minuteOfDay & 0xFF);
+  }
+  Pebble.sendAppMessage({ 'GraphData': bytes }, function () {}, function () {
+    console.log('CoasterWatch: failed to send GraphData');
   });
 }
 
@@ -696,54 +706,81 @@ function isParkOpenNow(schedule) {
 // ---------------------------------------------------------------------------
 // Main fetch cycle
 
-function fetchQueueTimes() {
+function fetchQueueTimes(forceSend) {
   var apiUrl = 'https://queue-times.com/parks/' + getSelectedParkId() + '/queue_times.json';
   var park = getActivePark();
-  getLocation(function (loc) {
-    xhrRequest(apiUrl, 'GET', function (responseText) {
-      try {
-        var data = JSON.parse(responseText);
-        var rides = flattenRides(data);
-        if (rides.length === 0) {
-          sendError('No ride data available');
+
+  var locationResult = undefined;
+  var queueTimesData = undefined;
+  var queueTimesErr = null;
+  var hasProcessed = false;
+
+  function tryProcess() {
+    if (locationResult === undefined || (queueTimesData === undefined && !queueTimesErr)) {
+      return; // Still waiting for parallel requests to settle
+    }
+    if (hasProcessed) return;
+    hasProcessed = true;
+
+    if (queueTimesErr || !queueTimesData) {
+      sendError(queueTimesErr || 'Fetch failed');
+      return;
+    }
+
+    try {
+      var data = JSON.parse(queueTimesData);
+      var rides = flattenRides(data);
+      if (rides.length === 0) {
+        sendError('No ride data available');
+        return;
+      }
+      fetchParkSchedule(park, function (schedule) {
+        if (!isParkOpenNow(schedule)) {
+          for (var i = 0; i < rides.length; i++) rides[i].is_open = false;
+        }
+
+        // Record every ride (not just visible ones) so hiding/unhiding a
+        // ride later doesn't lose history collected while it was hidden.
+        appendHistory(rides);
+
+        var visible = getVisibleIdSet();
+        var filtered = rides.filter(function (r) { return visible.has(r.id); });
+        if (filtered.length === 0) {
+          sendError('No rides selected - check settings');
           return;
         }
-        fetchParkSchedule(park, function (schedule) {
-          if (!isParkOpenNow(schedule)) {
-            for (var i = 0; i < rides.length; i++) rides[i].is_open = false;
-          }
+        attachDistances(filtered, locationResult);
+        sendRidesToWatch(filtered, forceSend);
+      });
+    } catch (e) {
+      sendError('Bad response from server');
+    }
+  }
 
-          // Record every ride (not just visible ones) so hiding/unhiding a
-          // ride later doesn't lose history collected while it was hidden.
-          appendHistory(rides);
+  // Fire GPS and network requests concurrently
+  getLocation(function (loc) {
+    locationResult = loc;
+    tryProcess();
+  });
 
-          var visible = getVisibleIdSet();
-          var filtered = rides.filter(function (r) { return visible.has(r.id); });
-          if (filtered.length === 0) {
-            sendError('No rides selected - check settings');
-            return;
-          }
-          attachDistances(filtered, loc);
-          sendRidesToWatch(filtered);
-        });
-      } catch (e) {
-        sendError('Bad response from server');
-      }
-    }, function (errMsg) {
-      sendError('Fetch failed: ' + errMsg);
-    });
+  xhrRequest(apiUrl, 'GET', function (responseText) {
+    queueTimesData = responseText;
+    tryProcess();
+  }, function (errMsg) {
+    queueTimesErr = 'Fetch failed: ' + errMsg;
+    tryProcess();
   });
 }
 
 Pebble.addEventListener('ready', function () {
   console.log('CoasterWatch: PebbleKit JS ready');
   sendBandConfig();
-  fetchQueueTimes();
+  fetchQueueTimes(true);
 });
 
 Pebble.addEventListener('appmessage', function (e) {
   if (e.payload && e.payload['RequestRefresh'] !== undefined) {
-    fetchQueueTimes();
+    fetchQueueTimes(true);
   }
   if (e.payload && e.payload['RequestGraph'] !== undefined) {
     sendGraph(e.payload['RequestGraph']);
@@ -1159,7 +1196,7 @@ Pebble.addEventListener('webviewclosed', function (e) {
       refresh = true;
     }
 
-    if (refresh) fetchQueueTimes();
+    if (refresh) fetchQueueTimes(true);
   } catch (ex) {
     console.log('CoasterWatch: bad config response: ' + ex);
   }

@@ -242,6 +242,29 @@ test('isParkOpenNow: false for a non-OPERATING day, true (fail-open) when schedu
     true, 'unparseable times must fail open too');
 });
 
+function unpackRidesData(sentMessages) {
+  const msg = sentMessages.find((m) => 'RidesData' in m);
+  if (!msg) return [];
+  const bytes = msg.RidesData;
+  const count = bytes[0];
+  const out = [];
+  let offset = 1;
+  for (let i = 0; i < count && offset < bytes.length; i++) {
+    const id = (bytes[offset] << 24) | (bytes[offset + 1] << 16) | (bytes[offset + 2] << 8) | bytes[offset + 3];
+    offset += 4;
+    const wait = ((bytes[offset] << 8) | bytes[offset + 1]) << 16 >> 16;
+    offset += 2;
+    const dist = (bytes[offset] << 24) | (bytes[offset + 1] << 16) | (bytes[offset + 2] << 8) | bytes[offset + 3];
+    offset += 4;
+    const nameLen = bytes[offset++];
+    let name = '';
+    for (let k = 0; k < nameLen; k++) name += String.fromCharCode(bytes[offset + k]);
+    offset += nameLen;
+    out.push({ id, wait, dist, name });
+  }
+  return out;
+}
+
 test('fetchQueueTimes overrides every ride to closed when the park schedule says it is not open, ' +
   'even though queue-times.com itself still reports is_open:true', () => {
   let scheduleFetches = 0;
@@ -257,10 +280,10 @@ test('fetchQueueTimes overrides every ride to closed when the park schedule says
 
   pkjs.fetchQueueTimes();
 
-  const sentWaits = pkjs.__sentMessages.filter((m) => 'RideWait' in m).map((m) => m.RideWait);
-  assert.ok(sentWaits.length > 0, 'expected at least one RideWait to have been sent');
-  assert.ok(sentWaits.every((w) => w === -1),
-    'every ride must be forced closed (-1) once the park schedule says it is not open: got ' + JSON.stringify(sentWaits));
+  const rides = unpackRidesData(pkjs.__sentMessages);
+  assert.ok(rides.length > 0, 'expected at least one ride in RidesData');
+  assert.ok(rides.every((r) => r.wait === -1),
+    'every ride must be forced closed (-1) once the park schedule says it is not open: got ' + JSON.stringify(rides));
   assert.strictEqual(scheduleFetches, 1);
 });
 
@@ -277,10 +300,11 @@ test('fetchQueueTimes leaves queue-times.com\'s own is_open alone while the park
 
   pkjs.fetchQueueTimes();
 
+  const rides = unpackRidesData(pkjs.__sentMessages);
   const byId = {};
-  pkjs.__sentMessages.forEach((m) => { if ('RideId' in m) byId[m.RideId] = m; });
-  assert.strictEqual(byId[RIDE_A].RideWait, 25, 'an open ride\'s real wait must pass through unchanged');
-  assert.strictEqual(byId[RIDE_B].RideWait, -1, 'a ride queue-times.com itself already reports closed must stay closed');
+  rides.forEach((r) => { byId[r.id] = r; });
+  assert.strictEqual(byId[RIDE_A].wait, 25, 'an open ride\'s real wait must pass through unchanged');
+  assert.strictEqual(byId[RIDE_B].wait, -1, 'a ride queue-times.com itself already reports closed must stay closed');
 });
 
 test('the park schedule is cached for the day: a second fetchQueueTimes does not re-fetch it', () => {
@@ -303,66 +327,97 @@ test('the park schedule is cached for the day: a second fetchQueueTimes does not
 // ---------------------------------------------------------------------------
 // The ride-switch graph-stream race (see main.c's gi == s_graph_count fix)
 
-test('opening a second ride\'s graph before the first one finished streaming does not leak its points', async () => {
-  const pkjs = loadPkjs({
-    // Defer every AppMessage "ack" asynchronously (rather than the harness
-    // default of resolving inline) so sendGraph(RIDE_A)'s recursive point
-    // chain is still mid-flight — genuinely in progress, not just
-    // theoretically interruptible — when sendGraph(RIDE_B) starts, the same
-    // way a real Bluetooth round-trip leaves a window open.
-    sendAppMessageHandler: (dict, onSuccess) => { setImmediate(() => { if (onSuccess) onSuccess(); }); },
-  });
+test('sendGraph packages all points into an atomic GraphData byte array', () => {
+  const pkjs = loadPkjs();
 
-  // Distinct, unmistakable wait values per ride so a leaked point is
-  // identifiable by value alone, without needing to inspect pkjs internals.
-  for (let i = 0; i < 10; i++) pkjs.appendHistory([{ id: RIDE_A, name: 'A', is_open: true, wait_time: 111 }]);
-  for (let i = 0; i < 10; i++) pkjs.appendHistory([{ id: RIDE_B, name: 'B', is_open: true, wait_time: 222 }]);
-
-  pkjs.sendGraph(RIDE_A);
-  await new Promise((resolve) => setImmediate(resolve)); // let RIDE_A's GraphCount + first point go out
-  pkjs.sendGraph(RIDE_B); // supersedes RIDE_A's still-in-flight stream
-  await new Promise((resolve) => setTimeout(resolve, 50)); // let everything settle
-
-  const secondGraphCountIndex = pkjs.__sentMessages
-    .map((m, i) => ('GraphCount' in m ? i : -1)).filter((i) => i !== -1)[1];
-  assert.ok(secondGraphCountIndex !== undefined, 'expected a second GraphCount once RIDE_B was requested');
-
-  const afterSwitch = pkjs.__sentMessages.slice(secondGraphCountIndex);
-  const leakedRideAPoint = afterSwitch.find((m) => m.GraphWait === 111);
-  assert.strictEqual(leakedRideAPoint, undefined,
-    'no point from the superseded RIDE_A stream should ever be sent after RIDE_B\'s GraphCount');
-});
-
-test('a superseded ride-list stream stops instead of interleaving with the newer one', async () => {
-  const pkjs = loadPkjs({
-    // Same async-ack setup as the graph test above: the first
-    // sendRidesToWatch chain is genuinely mid-flight when the second starts.
-    sendAppMessageHandler: (dict, onSuccess) => { setImmediate(() => { if (onSuccess) onSuccess(); }); },
-  });
-
-  // Distinct wait values per batch so a leaked ride is identifiable by
-  // value alone — modeled on a park switch, where the stale chain's rides
-  // belong to a different park entirely.
-  const oldParkRides = [];
-  const newParkRides = [];
-  for (let i = 0; i < 10; i++) {
-    oldParkRides.push({ id: 1000 + i, name: 'Old ' + i, is_open: true, wait_time: 111, _distance: -1 });
-    newParkRides.push({ id: 2000 + i, name: 'New ' + i, is_open: true, wait_time: 222, _distance: -1 });
+  for (let i = 0; i < 5; i++) {
+    pkjs.appendHistory([{ id: RIDE_A, name: 'A', is_open: true, wait_time: (i + 1) * 10 }]);
   }
 
-  pkjs.sendRidesToWatch(oldParkRides);
-  await new Promise((resolve) => setImmediate(resolve)); // let TotalCount + the first ride go out
-  pkjs.sendRidesToWatch(newParkRides); // supersedes the still-in-flight stream
-  await new Promise((resolve) => setTimeout(resolve, 50)); // let everything settle
+  pkjs.sendGraph(RIDE_A);
 
-  const secondTotalIndex = pkjs.__sentMessages
-    .map((m, i) => ('TotalCount' in m ? i : -1)).filter((i) => i !== -1)[1];
-  assert.ok(secondTotalIndex !== undefined, 'expected a second TotalCount once the new batch started');
+  assert.strictEqual(pkjs.__sentMessages.length, 1, 'expected exactly 1 atomic message for GraphData');
+  const msg = pkjs.__sentMessages[0];
+  assert.ok(msg.GraphData, 'message must contain GraphData');
+  assert.strictEqual(msg.GraphData.length, 5 * 3, '5 points * 3 bytes per point');
 
-  const afterSwitch = pkjs.__sentMessages.slice(secondTotalIndex);
-  const leakedOldRide = afterSwitch.find((m) => m.RideWait === 111);
-  assert.strictEqual(leakedOldRide, undefined,
-    'no ride from the superseded stream should ever be sent after the new stream\'s TotalCount');
+  // Verify unpacked wait values
+  const waits = [];
+  for (let i = 0; i < msg.GraphData.length; i += 3) {
+    waits.push(msg.GraphData[i]);
+  }
+  assert.deepStrictEqual(waits, [10, 20, 30, 40, 50]);
+});
+
+test('sendRidesToWatch packages all rides into an atomic RidesData byte array', () => {
+  const pkjs = loadPkjs();
+
+  const rides = [
+    { id: 11281, name: 'Abyssus', is_open: true, wait_time: 15, _distance: 120 },
+    { id: 11270, name: 'Hyperion', is_open: false, wait_time: 30, _distance: 350 },
+  ];
+
+  pkjs.sendRidesToWatch(rides);
+
+  assert.strictEqual(pkjs.__sentMessages.length, 1, 'expected exactly 1 atomic message for RidesData');
+  const msg = pkjs.__sentMessages[0];
+  assert.ok(msg.RidesData, 'message must contain RidesData');
+
+  const bytes = msg.RidesData;
+  assert.strictEqual(bytes[0], 2, 'count must be 2');
+
+  // Unpack ride 1 (Abyssus)
+  let offset = 1;
+  const id1 = (bytes[offset] << 24) | (bytes[offset + 1] << 16) | (bytes[offset + 2] << 8) | bytes[offset + 3];
+  offset += 4;
+  const wait1 = (bytes[offset] << 8) | bytes[offset + 1];
+  offset += 2;
+  const dist1 = (bytes[offset] << 24) | (bytes[offset + 1] << 16) | (bytes[offset + 2] << 8) | bytes[offset + 3];
+  offset += 4;
+  const nameLen1 = bytes[offset++];
+  let name1 = '';
+  for (let k = 0; k < nameLen1; k++) name1 += String.fromCharCode(bytes[offset + k]);
+  offset += nameLen1;
+
+  assert.strictEqual(id1, 11281);
+  assert.strictEqual(wait1, 15);
+  assert.strictEqual(dist1, 120);
+  assert.strictEqual(name1, 'Abyssus');
+
+  // Unpack ride 2 (Hyperion, closed => wait -1)
+  const id2 = (bytes[offset] << 24) | (bytes[offset + 1] << 16) | (bytes[offset + 2] << 8) | bytes[offset + 3];
+  offset += 4;
+  const wait2 = ((bytes[offset] << 8) | bytes[offset + 1]) << 16 >> 16; // sign extend 16-bit
+  offset += 2;
+  const dist2 = (bytes[offset] << 24) | (bytes[offset + 1] << 16) | (bytes[offset + 2] << 8) | bytes[offset + 3];
+  offset += 4;
+  const nameLen2 = bytes[offset++];
+  let name2 = '';
+  for (let k = 0; k < nameLen2; k++) name2 += String.fromCharCode(bytes[offset + k]);
+
+  assert.strictEqual(id2, 11270);
+  assert.strictEqual(wait2, -1, 'closed ride must encode wait as -1');
+  assert.strictEqual(dist2, 350);
+  assert.strictEqual(name2, 'Hyperion');
+});
+
+test('sendRidesToWatch skips transmission when data is unchanged unless forceSend is set', () => {
+  const pkjs = loadPkjs();
+
+  const rides = [
+    { id: 11281, name: 'Abyssus', is_open: true, wait_time: 15, _distance: 120 },
+  ];
+
+  pkjs.sendRidesToWatch(rides, true);
+  assert.strictEqual(pkjs.__sentMessages.length, 1);
+
+  // Calling again without forceSend and identical data should not send a message
+  pkjs.sendRidesToWatch(rides, false);
+  assert.strictEqual(pkjs.__sentMessages.length, 1, 'duplicate data must skip BLE send');
+
+  // Calling with forceSend should send
+  pkjs.sendRidesToWatch(rides, true);
+  assert.strictEqual(pkjs.__sentMessages.length, 2, 'forceSend must send even if duplicate');
 });
 
 (async () => {
