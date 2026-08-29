@@ -634,13 +634,33 @@ static void draw_bell_icon(GContext *ctx, GPoint top, GColor color) {
 // color platforms (emery/gabbro). Centers vertically instead, by measuring
 // the text's own rendered height first and offsetting the draw rect to
 // match; still wraps/truncates exactly as the given overflow mode says.
-static void draw_vcentered_text(GContext *ctx, const char *msg, GFont font, GRect bounds,
-                                 GTextOverflowMode overflow_mode) {
+//
+// graphics_text_layout_get_content_size()'s returned height is the font's
+// own baked-in line metric (ascent + descent + whatever headroom it
+// reserves for glyphs this specific string doesn't use, e.g. accented
+// capitals or descenders like g/y/p) — not a tight bounding box of the
+// actual rendered ink. Centering that box is only visually accurate for
+// text that fills close to the font's full vertical range; short strings
+// or symbol glyphs that don't reach the top/bottom of it end up with their
+// visible ink off-center within a box that's itself correctly centered.
+// Pebble's public API has no way to query ascent/descent separately to
+// correct for this analytically, so `y_nudge` exists as an escape hatch —
+// pass 0 normally; a non-zero value should come from measuring the actual
+// rendered pixels for that specific font/string (e.g. via a screenshot),
+// not a guess, since the needed correction is a property of that specific
+// font's own metrics and doesn't transfer to a different font/size.
+static void draw_vcentered_text_nudged(GContext *ctx, const char *msg, GFont font, GRect bounds,
+                                        GTextOverflowMode overflow_mode, int y_nudge) {
   GSize content = graphics_text_layout_get_content_size(msg, font, bounds, overflow_mode, GTextAlignmentCenter);
-  int y = bounds.origin.y + (bounds.size.h - content.h) / 2;
+  int y = bounds.origin.y + (bounds.size.h - content.h) / 2 + y_nudge;
   if (y < bounds.origin.y) y = bounds.origin.y;
   GRect text_rect = GRect(bounds.origin.x, y, bounds.size.w, content.h);
   graphics_draw_text(ctx, msg, font, text_rect, overflow_mode, GTextAlignmentCenter, NULL);
+}
+
+static void draw_vcentered_text(GContext *ctx, const char *msg, GFont font, GRect bounds,
+                                 GTextOverflowMode overflow_mode) {
+  draw_vcentered_text_nudged(ctx, msg, font, bounds, overflow_mode, 0);
 }
 
 static void grid_update_proc(Layer *layer, GContext *ctx) {
@@ -1012,7 +1032,15 @@ static void detail_alert_update_proc(Layer *layer, GContext *ctx) {
   // glyph actually needs, so there's no meaningful gap to begin with.
   GRect label_rect = GRect(minus_rect.origin.x + minus_rect.size.w, 4,
                             plus_rect.origin.x - (minus_rect.origin.x + minus_rect.size.w), bounds.size.h - 8);
-  draw_vcentered_text(ctx, buf, fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD), label_rect, GTextOverflowModeFill);
+  // GOTHIC_14_BOLD reserves several px of unused headroom above this
+  // text's actual ink (it has no descenders: "Alert ON: <Nm" / "Alert
+  // off"), which plain box-centering doesn't account for - see
+  // draw_vcentered_text_nudged's comment. Measured directly against a
+  // real-watch screenshot: box-centered ink sat at rows 20-28 of the
+  // 44px band (visual center 24) against a true center of 21.5, a ~2.5px
+  // low bias, so nudge up by 3 to compensate.
+  draw_vcentered_text_nudged(ctx, buf, fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD), label_rect,
+                              GTextOverflowModeFill, -3);
 }
 
 static void toggle_alert_for_current_ride(void) {
