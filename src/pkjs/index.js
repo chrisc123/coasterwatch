@@ -547,7 +547,18 @@ function getGraphPoints(rideId) {
 // ---------------------------------------------------------------------------
 // Sending to the watch
 
-function sendNext(i, rides) {
+// Same superseded-stream guard as graphRequestSeq below, for the same
+// reason: two overlapping fetchQueueTimes completions (the periodic timer
+// racing a settings-close refresh, or a park switch while the previous
+// chain is still retrying through a Bluetooth hiccup) would otherwise
+// interleave two send chains — and after a park switch, the stale chain
+// would keep writing the *old park's* rides into the new list's indices.
+// The retry path especially needs this: it re-fires on a 500ms timer for
+// as long as sends keep failing, with no other bound.
+var rideStreamSeq = 0;
+
+function sendNext(i, rides, seq) {
+  if (seq !== rideStreamSeq) return;
   if (i >= rides.length) return;
   var r = rides[i];
   var dict = {
@@ -558,17 +569,20 @@ function sendNext(i, rides) {
     'RideDistance': (r._distance !== undefined) ? r._distance : -1
   };
   Pebble.sendAppMessage(dict, function () {
-    sendNext(i + 1, rides);
+    sendNext(i + 1, rides, seq);
   }, function () {
+    if (seq !== rideStreamSeq) return;
     console.log('CoasterWatch: send failed for ride ' + i + ', retrying');
-    setTimeout(function () { sendNext(i, rides); }, 500);
+    setTimeout(function () { sendNext(i, rides, seq); }, 500);
   });
 }
 
 function sendRidesToWatch(rides) {
+  rideStreamSeq++;
+  var seq = rideStreamSeq;
   var capped = rides.slice(0, MAX_RIDES);
   Pebble.sendAppMessage({ 'TotalCount': capped.length }, function () {
-    sendNext(0, capped);
+    sendNext(0, capped, seq);
   }, function () {
     console.log('CoasterWatch: failed to send TotalCount');
   });

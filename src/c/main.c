@@ -162,6 +162,21 @@ static RideTile s_rides[MAX_RIDES];
 static int      s_order[MAX_RIDES];   // indices into s_rides, current display order
 static int      s_ride_count = 0;
 static int      s_cursor     = 0;     // position within s_order
+// The ride the user last put the cursor on (via UP/DOWN or a tap), or -1 if
+// they haven't touched it yet. recompute_order() re-finds this ride after
+// every re-sort so the highlight follows the *ride*, not whatever else the
+// sort just moved into that grid position — which also means a background
+// refresh no longer warps the cursor anywhere.
+static int32_t  s_cursor_ride_id = -1;
+// Ride count the in-flight refresh's TotalCount announced, or 0 when no
+// stream is in flight. The old tiles keep drawing (and s_ride_count keeps
+// its old value) while the refreshed list streams in over the top; only
+// once the final announced ride has arrived does the count snap to the new
+// total — that's what shrinks the list when the new one is shorter (park
+// switch, rides deselected). Resetting the count to 0 up front instead
+// (the old behavior) flashed "Loading queue times..." and reset the
+// cursor/scroll on every silent 5-minute background refresh.
+static int      s_pending_total = 0;
 static bool     s_phone_connected = false;
 static bool     s_show_error      = false;
 static SortMode s_sort_mode       = SORT_TIME;
@@ -268,7 +283,31 @@ static void recompute_order(void) {
     }
     s_order[j + 1] = key;
   }
+  // The cursor tracks a ride, not a grid position, once the user has
+  // actually chosen one (see s_cursor_ride_id) — so a refresh or sort-mode
+  // change moves the highlight along with the ride rather than leaving it
+  // on whatever the sort shuffled into that slot. A ride that vanished
+  // (hidden in settings, park switched) drops back to position-based
+  // clamping rather than chasing an id that no longer exists.
+  if (s_cursor_ride_id >= 0) {
+    int found = -1;
+    for (int i = 0; i < s_ride_count; i++) {
+      if (s_rides[s_order[i]].ride_id == s_cursor_ride_id) { found = i; break; }
+    }
+    if (found >= 0) s_cursor = found;
+    else s_cursor_ride_id = -1;
+  }
   if (s_cursor >= s_ride_count) s_cursor = s_ride_count > 0 ? s_ride_count - 1 : 0;
+}
+
+// Call after any *user-driven* cursor move (UP/DOWN, tap) — deliberately not
+// from recompute_order itself, so passive re-sorts before the user has
+// touched anything don't lock the cursor onto whichever ride happened to be
+// under position 0 at the time.
+static void remember_cursor_ride(void) {
+  if (s_cursor < s_ride_count) {
+    s_cursor_ride_id = s_rides[s_order[s_cursor]].ride_id;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -872,6 +911,7 @@ static void open_detail_window(void);
 static void up_click_handler(ClickRecognizerRef recognizer, void *context) {
   if (s_cursor > 0) {
     s_cursor--;
+    remember_cursor_ride();
     update_header();
     scroll_to_show_cursor(true);
     layer_mark_dirty(s_grid_content_layer);
@@ -881,6 +921,7 @@ static void up_click_handler(ClickRecognizerRef recognizer, void *context) {
 static void down_click_handler(ClickRecognizerRef recognizer, void *context) {
   if (s_cursor < s_ride_count - 1) {
     s_cursor++;
+    remember_cursor_ride();
     update_header();
     scroll_to_show_cursor(true);
     layer_mark_dirty(s_grid_content_layer);
@@ -932,6 +973,7 @@ static void main_tap_handler(const Recognizer *recognizer, RecognizerEvent event
   if (hit_test_tile(p, &order_pos)) {
     vibes_short_pulse();
     s_cursor = order_pos;
+    remember_cursor_ride();
     update_header();
     layer_mark_dirty(s_grid_content_layer);
     open_detail_window();
@@ -1332,12 +1374,15 @@ static void open_detail_window(void) {
 static void inbox_received_callback(DictionaryIterator *iter, void *context) {
   Tuple *t_total = dict_find(iter, MESSAGE_KEY_TotalCount);
   if (t_total) {
-    s_ride_count = 0;
-    s_cursor     = 0;
+    // Deliberately does NOT reset s_ride_count/s_cursor here: the current
+    // tiles keep drawing while the refreshed list streams in over the top
+    // (each ride overwrites its slot in place as it arrives, in order).
+    // Resetting up front made every silent 5-minute background refresh
+    // flash "Loading queue times..." and warp the cursor back to the first
+    // tile. See s_pending_total's declaration for how a *shorter* new list
+    // still shrinks correctly once its last ride lands.
+    s_pending_total = t_total->value->int32;
     s_show_error = false;
-    update_grid_layout();
-    update_header();
-    layer_mark_dirty(s_grid_content_layer);
     return;
   }
 
@@ -1355,11 +1400,32 @@ static void inbox_received_callback(DictionaryIterator *iter, void *context) {
       s_rides[idx].wait_minutes = (int16_t)t_wait->value->int32;
       s_rides[idx].distance_m = t_dist ? t_dist->value->int32 : -1;
       if (idx + 1 > s_ride_count) s_ride_count = idx + 1;
+      // Last announced ride has arrived: snap to the new total, which is
+      // what actually shrinks the list when the refresh carried fewer rides
+      // than are currently showing (park switch, rides deselected) — until
+      // then the old tail keeps drawing rather than blanking out.
+      if (s_pending_total > 0 && idx + 1 >= s_pending_total) {
+        s_ride_count = s_pending_total;
+        s_pending_total = 0;
+      }
       s_show_error = false;
       recompute_order();
       update_grid_layout();
       update_header();
       layer_mark_dirty(s_grid_content_layer);
+      // If this ride's detail view is open right now, its header wait and
+      // the alert band's met/waiting coloring (and the graph's threshold
+      // line color) are all driven by s_detail_wait — without this they
+      // kept showing the stale wait from when the view was opened, so the
+      // alert could buzz (check_alert_for_ride below uses fresh data)
+      // while the band still showed "armed, waiting". The detail view is
+      // exactly where someone sits watching for that alert to fire.
+      if (s_rides[idx].ride_id == s_detail_ride_id) {
+        s_detail_wait = s_rides[idx].wait_minutes;
+        update_detail_header();
+        if (s_detail_alert_layer) layer_mark_dirty(s_detail_alert_layer);
+        if (s_detail_graph_layer) layer_mark_dirty(s_detail_graph_layer);
+      }
       check_alert_for_ride(s_rides[idx].ride_id, s_rides[idx].wait_minutes);
     }
     return;

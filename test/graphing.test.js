@@ -344,6 +344,38 @@ test('opening a second ride\'s graph before the first one finished streaming doe
     'no point from the superseded RIDE_A stream should ever be sent after RIDE_B\'s GraphCount');
 });
 
+test('a superseded ride-list stream stops instead of interleaving with the newer one', async () => {
+  const pkjs = loadPkjs({
+    // Same async-ack setup as the graph test above: the first
+    // sendRidesToWatch chain is genuinely mid-flight when the second starts.
+    sendAppMessageHandler: (dict, onSuccess) => { setImmediate(() => { if (onSuccess) onSuccess(); }); },
+  });
+
+  // Distinct wait values per batch so a leaked ride is identifiable by
+  // value alone — modeled on a park switch, where the stale chain's rides
+  // belong to a different park entirely.
+  const oldParkRides = [];
+  const newParkRides = [];
+  for (let i = 0; i < 10; i++) {
+    oldParkRides.push({ id: 1000 + i, name: 'Old ' + i, is_open: true, wait_time: 111, _distance: -1 });
+    newParkRides.push({ id: 2000 + i, name: 'New ' + i, is_open: true, wait_time: 222, _distance: -1 });
+  }
+
+  pkjs.sendRidesToWatch(oldParkRides);
+  await new Promise((resolve) => setImmediate(resolve)); // let TotalCount + the first ride go out
+  pkjs.sendRidesToWatch(newParkRides); // supersedes the still-in-flight stream
+  await new Promise((resolve) => setTimeout(resolve, 50)); // let everything settle
+
+  const secondTotalIndex = pkjs.__sentMessages
+    .map((m, i) => ('TotalCount' in m ? i : -1)).filter((i) => i !== -1)[1];
+  assert.ok(secondTotalIndex !== undefined, 'expected a second TotalCount once the new batch started');
+
+  const afterSwitch = pkjs.__sentMessages.slice(secondTotalIndex);
+  const leakedOldRide = afterSwitch.find((m) => m.RideWait === 111);
+  assert.strictEqual(leakedOldRide, undefined,
+    'no ride from the superseded stream should ever be sent after the new stream\'s TotalCount');
+});
+
 (async () => {
   for (const { name, fn } of tests) {
     try {
