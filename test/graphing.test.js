@@ -7,6 +7,10 @@
 // Run with: node test/graphing.test.js
 'use strict';
 
+// Fixed so graphFloorMinuteOfDay's UTC-instant-to-local-minute conversion is
+// simple to hand-verify in its test (no dependence on this machine's zone).
+process.env.TZ = 'UTC';
+
 const assert = require('assert');
 const { loadPkjs } = require('./pkjs-harness');
 
@@ -119,6 +123,46 @@ function seedHistory(rideId, samples) {
     },
   });
 }
+
+// Energylandia's park id (317) - matches DEFAULT_PARK_ID, so getGraphPoints'
+// internal loadCachedSchedule(getSelectedParkId()) call finds this without
+// any park-selection seeding.
+function seedHistoryWithSchedule(rideId, samples, openingTimeIso) {
+  return loadPkjs({
+    storageSeed: {
+      queueHistory_v1: JSON.stringify({ date: localTodayStr(), rides: { [rideId]: samples } }),
+      parkSchedule_v1: JSON.stringify({
+        317: { type: 'OPERATING', openingTime: openingTimeIso, closingTime: '2026-01-01T23:00:00Z' },
+      }),
+    },
+  });
+}
+
+test('getGraphPoints drops samples from more than an hour before the park opened, entirely - ' +
+  'not just compressed like a same-day gap', () => {
+  // TZ is pinned to UTC at the top of this file, so the floor (opening
+  // minus 60 min) is simply the opening hour/minute minus one hour.
+  const floorMinute = 9 * 60; // 10:00 opening - 60 min = 09:00
+  const pkjs = seedHistoryWithSchedule(RIDE_A, [
+    [floorMinute - 20, 0], [floorMinute - 10, 0], // before the floor: not real queue data, drop entirely
+    [floorMinute + 5, 15], [floorMinute + 65, 20], [floorMinute + 125, 25], // after the floor: real
+  ], '2026-01-01T10:00:00Z');
+
+  const points = pkjs.getGraphPoints(RIDE_A);
+  assert.ok(points, 'expected a valid graph after filtering');
+  assert.strictEqual(points.length, 3, 'the 2 pre-floor samples must be dropped entirely, not compressed to markers');
+  assert.deepStrictEqual([...points.map((p) => p.wait)], [15, 20, 25]);
+});
+
+test('getGraphPoints keeps a sample recorded within the hour-early-entry window before opening', () => {
+  const floorMinute = 9 * 60;
+  const pkjs = seedHistoryWithSchedule(RIDE_A, [
+    [floorMinute + 1, 0], [floorMinute + 30, 5], [floorMinute + 65, 15],
+  ], '2026-01-01T10:00:00Z');
+
+  const points = pkjs.getGraphPoints(RIDE_A);
+  assert.strictEqual(points.length, 3, 'a sample right at/after the floor must be kept, not dropped');
+});
 
 test('getGraphPoints compresses an earlier, disconnected session down to 2 marker points', () => {
   const midnightTesting = [[2, 0], [5, 0], [8, 0], [11, 0], [14, 0], [17, 0], [20, 0], [23, 0]];

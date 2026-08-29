@@ -443,6 +443,24 @@ var GRAPH_SESSION_GAP_MINUTES = 60;
 // crowd out resolution for the data that's actually relevant right now.
 var GRAPH_OLD_SESSION_MAX_POINTS = 2;
 
+// Minute-of-day (phone-local), 60 minutes before the active park's cached
+// opening time - null if no cached schedule is available yet. Some parks
+// let guests in a little before the official opening time, hence the hour
+// of slack rather than filtering right at the opening minute. Reuses the
+// schedule already fetched/cached for the closed-ride override (see
+// isParkOpenNow above) rather than being a new network dependency of its
+// own. Converts through the phone's own Date methods (always local by JS
+// spec), same reasoning as isParkOpenNow - the park and phone/watch can be
+// in different timezones.
+function graphFloorMinuteOfDay() {
+  var schedule = loadCachedSchedule(getSelectedParkId());
+  if (!schedule || !schedule.openingTime) return null;
+  var openMs = Date.parse(schedule.openingTime);
+  if (isNaN(openMs)) return null;
+  var floor = new Date(openMs - 60 * 60 * 1000);
+  return ((floor.getHours() * 60 + floor.getMinutes()) % 1440 + 1440) % 1440;
+}
+
 function downsample(arr, maxPoints) {
   if (arr.length <= maxPoints) return arr;
   var out = [];
@@ -470,15 +488,25 @@ function splitIntoSessions(arr) {
 // let it detect/mark a big gap between two consecutive points — the watch
 // spaces points evenly by index, not by elapsed time, precisely so a gap
 // doesn't stretch the axis to cover a long dead stretch and squeeze
-// everything else into a sliver. Any *older* session (see
+// everything else into a sliver. Samples from before the park could
+// plausibly have been open (see graphFloorMinuteOfDay) are dropped
+// entirely, not just compressed — there's no legitimate reading to hint at
+// from before the park opened. Any remaining *older* session (see
 // splitIntoSessions) is compressed down to GRAPH_OLD_SESSION_MAX_POINTS
-// first, for the reason above; only the current session competes for the
-// remaining MAX_GRAPH_POINTS budget. History never spans midnight since it
-// resets daily, so there's no wraparound to account for.
+// instead, for a real same-day gap (e.g. Bluetooth dropped for a while);
+// only the current session competes for the remaining MAX_GRAPH_POINTS
+// budget. History never spans midnight since it resets daily, so there's
+// no wraparound to account for.
 function getGraphPoints(rideId) {
   var hist = loadHistory();
   var arr = hist.rides[rideId];
   if (!arr || arr.length < 2) return null;
+
+  var floor = graphFloorMinuteOfDay();
+  if (floor !== null) {
+    arr = arr.filter(function (s) { return s[0] >= floor; });
+    if (arr.length < 2) return null;
+  }
 
   var sessions = splitIntoSessions(arr);
   var current = sessions[sessions.length - 1];
