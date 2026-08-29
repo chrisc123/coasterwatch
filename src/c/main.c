@@ -1420,8 +1420,14 @@ static void main_window_load(Window *window) {
   text_layer_set_text_alignment(s_clock_layer, GTextAlignmentLeft);
   layer_add_child(root, text_layer_get_layer(s_clock_layer));
 
+  // Full remaining width, not shrunk for text breathing room — this is a
+  // TextLayer, so its own bounds are also its background fill; shrinking it
+  // left a plain white gap at the screen's right edge instead of the solid
+  // black bar the rest of the header shows. TextLayer's own text rendering
+  // already keeps a small inset from its edges, so right-aligned text here
+  // doesn't run into the physical screen edge either.
   s_header_layer = text_layer_create(GRect(HEADER_CLOCK_WIDTH, 0,
-                                            bounds.size.w - HEADER_CLOCK_WIDTH - 4, HEADER_HEIGHT));
+                                            bounds.size.w - HEADER_CLOCK_WIDTH, HEADER_HEIGHT));
   text_layer_set_background_color(s_header_layer, GColorBlack);
   text_layer_set_text_color(s_header_layer, GColorWhite);
 #endif
