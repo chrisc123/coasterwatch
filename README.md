@@ -39,8 +39,9 @@ Live roller-coaster queue times on your Pebble, powered by
 src/c/main.c        Watch-side app (C, Pebble SDK)
 src/pkjs/index.js   Phone-side companion (PebbleKit JS): fetches queue data,
                      builds the Clay settings page, talks to the watch
-test/               jsdom-based tests for the settings page (no phone/watch
-                     needed to run them)
+test/               jsdom/Node-based tests for the settings page and the
+                     graphing/history pipeline, with mocked queue-times.com
+                     and themeparks.wiki responses (no phone/watch needed)
 resources/          Watch app icon + the embedded custom font
 store-assets/        Appstore listing icon exports
 ```

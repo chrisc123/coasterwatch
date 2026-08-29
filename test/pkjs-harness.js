@@ -21,27 +21,63 @@ function makeLocalStorage(initial) {
   };
 }
 
-// Loads the PKJS module fresh into its own VM context. `storageSeed` presets
-// localStorage entries (e.g. { selectedParkId: '2' }) as if a prior save had
-// already happened, so tests can start from an arbitrary saved state.
-function loadPkjs(storageSeed) {
+// Loads the PKJS module fresh into its own VM context.
+//
+// `options.storageSeed` presets localStorage entries (e.g. { selectedParkId:
+// '2' }) as if a prior save had already happened, so tests can start from an
+// arbitrary saved state.
+//
+// `options.xhrHandler(url, method)` mocks network responses (queue-times.com,
+// themeparks.wiki) — return `{ status, responseText }` to resolve `onload`,
+// `{ error: true }` for `onerror`, `{ timeout: true }` for `ontimeout`, or
+// nothing/undefined to never resolve (matches the old default: any test that
+// doesn't pass a handler never triggers a network callback, same as before
+// this option existed). Called synchronously from `.send()` — a handler that
+// itself defers (e.g. via setImmediate) makes the whole chain async instead,
+// which is how the graph-stream-interleaving test below creates a genuine
+// race window.
+//
+// `options.sendAppMessageHandler(dict, onSuccess, onFailure)` overrides how
+// `Pebble.sendAppMessage` resolves; every call (regardless of handler) is
+// recorded into the returned context's `__sentMessages`. Default: record and
+// call `onSuccess()` synchronously.
+function loadPkjs(options) {
+  options = options || {};
   const src = fs.readFileSync(PKJS_PATH, 'utf8');
   const openedUrls = [];
   const handlers = {};
+  const sentMessages = [];
   const sandbox = {
     console,
-    localStorage: makeLocalStorage(storageSeed),
+    localStorage: makeLocalStorage(options.storageSeed),
     Pebble: {
       addEventListener: (event, fn) => { handlers[event] = fn; },
-      sendAppMessage: () => {},
+      sendAppMessage: (dict, onSuccess, onFailure) => {
+        sentMessages.push(dict);
+        if (options.sendAppMessageHandler) {
+          options.sendAppMessageHandler(dict, onSuccess, onFailure);
+        } else if (onSuccess) {
+          onSuccess();
+        }
+      },
       openURL: (url) => openedUrls.push(url),
       getActiveWatchInfo: () => null,
       getAccountToken: () => '',
       getWatchToken: () => '',
     },
     XMLHttpRequest: function XMLHttpRequestStub() {
-      this.open = () => {};
-      this.send = () => {};
+      const self = this;
+      this.open = (method, url) => { self._method = method; self._url = url; };
+      this.send = () => {
+        if (!options.xhrHandler) return;
+        const result = options.xhrHandler(self._url, self._method);
+        if (!result) return;
+        if (result.timeout) { if (self.ontimeout) self.ontimeout(); return; }
+        if (result.error) { if (self.onerror) self.onerror(); return; }
+        self.status = result.status !== undefined ? result.status : 200;
+        self.responseText = result.responseText;
+        if (self.onload) self.onload();
+      };
     },
     navigator: { geolocation: null },
   };
@@ -81,6 +117,7 @@ function loadPkjs(storageSeed) {
   vm.runInContext(src, sandbox, { filename: 'index.js' });
   sandbox.__openedUrls = openedUrls;
   sandbox.__handlers = handlers;
+  sandbox.__sentMessages = sentMessages;
   return sandbox;
 }
 
