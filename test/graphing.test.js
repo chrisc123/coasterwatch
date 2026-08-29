@@ -7,11 +7,6 @@
 // Run with: node test/graphing.test.js
 'use strict';
 
-// Fixed so graphPegMinuteOfDay's timezone conversion is deterministic and
-// exercises the actual scenario that motivated it: a UK-local phone/watch
-// tracking a Polish park.
-process.env.TZ = 'Europe/London';
-
 const assert = require('assert');
 const { loadPkjs } = require('./pkjs-harness');
 
@@ -138,31 +133,6 @@ test('isParkOpenNow: false for a non-OPERATING day, true (fail-open) when schedu
   assert.strictEqual(pkjs.isParkOpenNow({ type: 'OPERATING', openingTime: 'not a date', closingTime: 'nope' }),
     true, 'unparseable times must fail open too');
 });
-
-test('graphPegMinuteOfDay converts the park\'s opening time through the phone\'s OWN timezone', () => {
-  // Energylandia (Warsaw, CEST +02:00) opens at 10:00 - on a UK-local phone
-  // (TZ set at the top of this file) the peg (opening minus 30 min) must
-  // come out as 08:30 UK time, not 09:30 (which is what naively treating
-  // the clock-face "10:00" as if it were already local would give).
-  const pkjs = loadPkjs({
-    storageSeed: {
-      parkSchedule_v1: JSON.stringify({
-        317: { fetchedDate: pkjs_todayStr(), type: 'OPERATING', openingTime: '2026-08-29T10:00:00+02:00', closingTime: '2026-08-29T20:00:00+02:00' },
-      }),
-    },
-  });
-  const peg = pkjs.graphPegMinuteOfDay();
-  assert.strictEqual(peg, 8 * 60 + 30, 'expected 08:30 UK-local (30 min before 10:00 CEST)');
-});
-
-// todayStr()'s exact format (no zero-padding) has to match what the seeded
-// cache entry is keyed as fresh for - computed independently here (rather
-// than importing pkjs's own todayStr, which isn't available before loadPkjs
-// returns) so a seeded-cache test doesn't depend on load order.
-function pkjs_todayStr() {
-  const d = new Date();
-  return d.getFullYear() + '-' + (d.getMonth() + 1) + '-' + d.getDate();
-}
 
 test('fetchQueueTimes overrides every ride to closed when the park schedule says it is not open, ' +
   'even though queue-times.com itself still reports is_open:true', () => {

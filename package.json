@@ -52,8 +52,7 @@
       "BandColor1",
       "BandColor2",
       "AlertColor",
-      "VibePattern",
-      "GraphPegMinuteOfDay"
+      "VibePattern"
     ],
     "resources": {
       "media": [
