@@ -38,6 +38,12 @@
 
 #define MAX_RIDES         40
 #define MAX_GRAPH_POINTS  24
+// Graph x-axis is pegged to a fixed 08:00 start rather than the earliest
+// recorded sample: none of the supported parks open before this, and the
+// closed-park detection now means samples get recorded well before opening
+// too (see fetchParkSchedule() in pkjs), which used to drag the axis's start
+// backwards into a long flat "closed" tail instead of showing the day.
+#define GRAPH_START_MINUTE (8 * 60)
 #define TILE_COLS         2
 #define NAME_BUF_LEN      24
 #define HEADER_HEIGHT       18
@@ -832,8 +838,25 @@ static void detail_graph_update_proc(Layer *layer, GContext *ctx) {
   GRect area = GRect(bounds.origin.x + margin + 26, bounds.origin.y + margin,
                       bounds.size.w - 2 * margin - 26, bounds.size.h - 2 * margin - 14);
 
-  int16_t max_w = 10; // minimum scale span so a flat line isn't full-height
+  // x-axis is pegged to a fixed 08:00 start (see GRAPH_START_MINUTE) rather
+  // than whichever minute the earliest recorded sample happens to land on,
+  // so the graph reads the same shape day to day instead of its start
+  // drifting with whenever the phone first fetched today. Falls back to the
+  // old dynamic start if there isn't yet 2+ samples at/after 08:00 (e.g.
+  // checking before any park could plausibly be open) so the graph isn't
+  // left empty.
+  int start_idx = s_graph_count;
   for (int i = 0; i < s_graph_count; i++) {
+    if (s_graph_minute_of_day[i] >= GRAPH_START_MINUTE) { start_idx = i; break; }
+  }
+  bool pegged = (start_idx < s_graph_count) && (s_graph_count - start_idx >= 2);
+  if (!pegged) start_idx = 0;
+  int graph_start = pegged ? GRAPH_START_MINUTE : s_graph_minute_of_day[start_idx];
+  int graph_end = s_graph_minute_of_day[s_graph_count - 1];
+  if (graph_end <= graph_start) graph_end = graph_start + 1; // guard against a zero/negative span
+
+  int16_t max_w = 10; // minimum scale span so a flat line isn't full-height
+  for (int i = start_idx; i < s_graph_count; i++) {
     if (s_graph_points[i] > max_w) max_w = s_graph_points[i];
   }
 
@@ -872,12 +895,15 @@ static void detail_graph_update_proc(Layer *layer, GContext *ctx) {
   }
 
   GPoint prev = GPointZero;
-  for (int i = 0; i < s_graph_count; i++) {
-    int x = area.origin.x + (s_graph_count == 1 ? 0 : (area.size.w * i) / (s_graph_count - 1));
+  bool has_prev = false;
+  for (int i = start_idx; i < s_graph_count; i++) {
+    int x = area.origin.x + (area.size.w * (s_graph_minute_of_day[i] - graph_start)) / (graph_end - graph_start);
+    if (x < area.origin.x) x = area.origin.x;
+    if (x > area.origin.x + area.size.w) x = area.origin.x + area.size.w;
     int w = s_graph_points[i] < 0 ? 0 : s_graph_points[i];
     int y = area.origin.y + area.size.h - (area.size.h * w) / max_w;
     GPoint p = GPoint(x, y);
-    if (i > 0) {
+    if (has_prev) {
       graphics_context_set_stroke_color(ctx, GColorBlue);
       graphics_context_set_stroke_width(ctx, 2);
       graphics_draw_line(ctx, prev, p);
@@ -885,6 +911,7 @@ static void detail_graph_update_proc(Layer *layer, GContext *ctx) {
     graphics_context_set_fill_color(ctx, GColorBlue);
     graphics_fill_circle(ctx, p, 2);
     prev = p;
+    has_prev = true;
   }
   graphics_context_set_stroke_width(ctx, 1);
 
@@ -898,7 +925,7 @@ static void detail_graph_update_proc(Layer *layer, GContext *ctx) {
                       GRect(bounds.origin.x, area.origin.y + area.size.h - 12, 28, 14),
                       GTextOverflowModeFill, GTextAlignmentLeft, NULL);
 
-  format_minute_of_day(s_graph_minute_of_day[0], buf, sizeof(buf));
+  format_minute_of_day(graph_start, buf, sizeof(buf));
   graphics_draw_text(ctx, buf, fonts_get_system_font(FONT_KEY_GOTHIC_14),
                       GRect(area.origin.x, bounds.origin.y + bounds.size.h - 14, 60, 14),
                       GTextOverflowModeFill, GTextAlignmentLeft, NULL);
