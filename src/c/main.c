@@ -1032,15 +1032,25 @@ static void detail_alert_update_proc(Layer *layer, GContext *ctx) {
   // glyph actually needs, so there's no meaningful gap to begin with.
   GRect label_rect = GRect(minus_rect.origin.x + minus_rect.size.w, 4,
                             plus_rect.origin.x - (minus_rect.origin.x + minus_rect.size.w), bounds.size.h - 8);
-  // GOTHIC_14_BOLD reserves several px of unused headroom above this
-  // text's actual ink (it has no descenders: "Alert ON: <Nm" / "Alert
-  // off"), which plain box-centering doesn't account for - see
-  // draw_vcentered_text_nudged's comment. Measured directly against a
-  // real-watch screenshot: box-centered ink sat at rows 20-28 of the
-  // 44px band (visual center 24) against a true center of 21.5, a ~2.5px
-  // low bias, so nudge up by 3 to compensate.
-  draw_vcentered_text_nudged(ctx, buf, fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD), label_rect,
-                              GTextOverflowModeFill, -3);
+  // Bigger font where the detail area is wide enough to spare it (emery's
+  // full 200px width, gabbro's ~184px inscribed square) - basalt (144) and
+  // chalk (~127px inscribed square) stay on the smaller size, since chalk's
+  // width already clips "Alert ON: <Nm" onto a cut-off second line even at
+  // the current size (a pre-existing, separate issue - confirmed this isn't
+  // something the font change caused, see the label-font revert commit).
+  // 150 sits cleanly between the two pairs.
+  bool wide_enough = bounds.size.w >= 150;
+  GFont label_font = fonts_get_system_font(wide_enough ? FONT_KEY_GOTHIC_18_BOLD : FONT_KEY_GOTHIC_14_BOLD);
+  // Both fonts reserve unused headroom above this text's actual ink (it has
+  // no descenders: "Alert ON: <Nm" / "Alert off"), which plain box-centering
+  // doesn't account for - see draw_vcentered_text_nudged's comment. Each
+  // measured directly against a real-watch screenshot (a different bias per
+  // font, not the same value reused): GOTHIC_14_BOLD's box-centered ink sat
+  // at rows 20-28 of the 44px band (center 24) against a true center of
+  // 21.5, a ~2.5px low bias; GOTHIC_18_BOLD's sat at rows 20-30 (center 25),
+  // a ~3.5px low bias.
+  int label_nudge = wide_enough ? -4 : -3;
+  draw_vcentered_text_nudged(ctx, buf, label_font, label_rect, GTextOverflowModeFill, label_nudge);
 }
 
 static void toggle_alert_for_current_ride(void) {
