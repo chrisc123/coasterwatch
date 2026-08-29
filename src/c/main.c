@@ -38,6 +38,12 @@
 
 #define MAX_RIDES         40
 #define MAX_GRAPH_POINTS  24
+// Minutes between two consecutive graph points beyond which the connecting
+// line is skipped (see detail_graph_update_proc) - well above the normal
+// ~5-15 min refresh cadence (REFRESH_INTERVAL_MS below, further stretched
+// on low battery), so it only fires on a real gap (app closed/backgrounded
+// a while, watch put away), not just a slow refresh tick.
+#define GRAPH_GAP_MINUTES 60
 #define TILE_COLS         2
 #define NAME_BUF_LEN      24
 #define HEADER_HEIGHT       18
@@ -840,19 +846,6 @@ static void detail_graph_update_proc(Layer *layer, GContext *ctx) {
   GRect area = GRect(bounds.origin.x + margin + 26, bounds.origin.y + margin,
                       bounds.size.w - 2 * margin - 26, bounds.size.h - 2 * margin - 14);
 
-  // x-axis spans the actual recorded range (earliest to latest sample
-  // today) rather than a fixed reference point: pegging it to a set time
-  // (tried both a fixed 08:00 and "30 min before this park's opening")
-  // left a misleading blank gap whenever the app/watch hadn't actually been
-  // recording since then, which is the common case rather than an edge
-  // case for a phone companion app. A closed period the app *did* record
-  // still shows correctly as a flat line at the start — see the
-  // closed-park schedule cross-check in pkjs — without needing the axis
-  // itself pinned to any particular clock time.
-  int graph_start = s_graph_minute_of_day[0];
-  int graph_end = s_graph_minute_of_day[s_graph_count - 1];
-  if (graph_end <= graph_start) graph_end = graph_start + 1; // guard against a zero/negative span
-
   int16_t max_w = 10; // minimum scale span so a flat line isn't full-height
   for (int i = 0; i < s_graph_count; i++) {
     if (s_graph_points[i] > max_w) max_w = s_graph_points[i];
@@ -892,16 +885,25 @@ static void detail_graph_update_proc(Layer *layer, GContext *ctx) {
     graphics_context_set_stroke_width(ctx, 1);
   }
 
+  // Points are spaced evenly by index, not by elapsed clock time: a real
+  // gap (Bluetooth dropped, app was closed a while) would otherwise stretch
+  // the axis to cover the dead stretch and squeeze every other point into a
+  // sliver — index spacing costs nothing when there's no gap, and never
+  // wastes space when there is one. A big gap is instead marked by skipping
+  // the connecting *line* into that point (its dot still draws), so it
+  // reads as "these two are separated in time" rather than a smooth
+  // transition that implies data which was never actually recorded.
   GPoint prev = GPointZero;
   bool has_prev = false;
+  int prev_minute = 0;
   for (int i = 0; i < s_graph_count; i++) {
-    int x = area.origin.x + (area.size.w * (s_graph_minute_of_day[i] - graph_start)) / (graph_end - graph_start);
-    if (x < area.origin.x) x = area.origin.x;
-    if (x > area.origin.x + area.size.w) x = area.origin.x + area.size.w;
+    int x = (s_graph_count == 1) ? area.origin.x
+                                  : area.origin.x + (area.size.w * i) / (s_graph_count - 1);
     int w = s_graph_points[i] < 0 ? 0 : s_graph_points[i];
     int y = area.origin.y + area.size.h - (area.size.h * w) / max_w;
     GPoint p = GPoint(x, y);
-    if (has_prev) {
+    bool gapped = has_prev && (s_graph_minute_of_day[i] - prev_minute > GRAPH_GAP_MINUTES);
+    if (has_prev && !gapped) {
       graphics_context_set_stroke_color(ctx, GColorBlue);
       graphics_context_set_stroke_width(ctx, 2);
       graphics_draw_line(ctx, prev, p);
@@ -909,6 +911,7 @@ static void detail_graph_update_proc(Layer *layer, GContext *ctx) {
     graphics_context_set_fill_color(ctx, GColorBlue);
     graphics_fill_circle(ctx, p, 2);
     prev = p;
+    prev_minute = s_graph_minute_of_day[i];
     has_prev = true;
   }
   graphics_context_set_stroke_width(ctx, 1);
@@ -923,7 +926,7 @@ static void detail_graph_update_proc(Layer *layer, GContext *ctx) {
                       GRect(bounds.origin.x, area.origin.y + area.size.h - 12, 28, 14),
                       GTextOverflowModeFill, GTextAlignmentLeft, NULL);
 
-  format_minute_of_day(graph_start, buf, sizeof(buf));
+  format_minute_of_day(s_graph_minute_of_day[0], buf, sizeof(buf));
   graphics_draw_text(ctx, buf, fonts_get_system_font(FONT_KEY_GOTHIC_14),
                       GRect(area.origin.x, bounds.origin.y + bounds.size.h - 14, 60, 14),
                       GTextOverflowModeFill, GTextAlignmentLeft, NULL);

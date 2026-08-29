@@ -429,48 +429,68 @@ function appendHistory(rides) {
 }
 
 // Minutes between consecutive samples beyond which they're treated as
-// separate sessions rather than one continuous stretch of monitoring - well
-// above the normal ~5-15 min refresh cadence (REFRESH_INTERVAL_MS in
-// main.c, further stretched on low battery), so it only fires on a real
-// gap (app closed/backgrounded a while, watch put away), not just a slow
-// refresh tick.
+// separate sessions - well above the normal ~5-15 min refresh cadence
+// (REFRESH_INTERVAL_MS in main.c, further stretched on low battery), so it
+// only fires on a real gap (app closed/backgrounded a while, watch put
+// away), not just a slow refresh tick.
 var GRAPH_SESSION_GAP_MINUTES = 60;
 
-// Drops everything before the LAST gap wider than GRAPH_SESSION_GAP_MINUTES,
-// so a stray earlier cluster of samples (e.g. testing the app at midnight,
-// then nothing until the park's actually open) doesn't drag the graph's
-// whole x-axis back to cover a long dead stretch, squeezing today's actual
-// data into a sliver at the end. `arr` is oldest-first [minute, wait] pairs.
-function trimToCurrentSession(arr) {
-  for (var i = arr.length - 1; i > 0; i--) {
-    if (arr[i][0] - arr[i - 1][0] > GRAPH_SESSION_GAP_MINUTES) {
-      return arr.slice(i);
-    }
+// How many points an *older* (not-current) session is allowed to keep -
+// just enough for its shape to register (first/last point) as a hint of
+// what it looked like, without competing with the current session for the
+// limited MAX_GRAPH_POINTS budget. A short, disconnected earlier session
+// (e.g. testing the app hours before the park opened) would otherwise
+// crowd out resolution for the data that's actually relevant right now.
+var GRAPH_OLD_SESSION_MAX_POINTS = 2;
+
+function downsample(arr, maxPoints) {
+  if (arr.length <= maxPoints) return arr;
+  var out = [];
+  for (var i = 0; i < maxPoints; i++) {
+    var idx = Math.round(i * (arr.length - 1) / (maxPoints - 1));
+    out.push(arr[idx]);
   }
-  return arr;
+  return out;
 }
 
-// Returns [{wait, minuteOfDay}, ...] oldest-first, downsampled to
-// MAX_GRAPH_POINTS, or null if fewer than 2 samples exist in the current
-// session (see trimToCurrentSession). minuteOfDay is the sample's actual
-// clock time (0-1439) rather than an age, so the watch can label the axis
-// with real times (e.g. "09:15") instead of "-85m" — history never spans
-// midnight since it resets daily, so there's no wraparound to account for.
+// Splits `arr` (oldest-first [minute, wait] pairs) wherever consecutive
+// samples are more than GRAPH_SESSION_GAP_MINUTES apart.
+function splitIntoSessions(arr) {
+  var sessions = [[arr[0]]];
+  for (var i = 1; i < arr.length; i++) {
+    if (arr[i][0] - arr[i - 1][0] > GRAPH_SESSION_GAP_MINUTES) sessions.push([]);
+    sessions[sessions.length - 1].push(arr[i]);
+  }
+  return sessions;
+}
+
+// Returns [{wait, minuteOfDay}, ...] oldest-first, or null if fewer than 2
+// samples exist today. minuteOfDay is the sample's actual clock time
+// (0-1439), sent along purely for the watch's axis-endpoint labels and to
+// let it detect/mark a big gap between two consecutive points — the watch
+// spaces points evenly by index, not by elapsed time, precisely so a gap
+// doesn't stretch the axis to cover a long dead stretch and squeeze
+// everything else into a sliver. Any *older* session (see
+// splitIntoSessions) is compressed down to GRAPH_OLD_SESSION_MAX_POINTS
+// first, for the reason above; only the current session competes for the
+// remaining MAX_GRAPH_POINTS budget. History never spans midnight since it
+// resets daily, so there's no wraparound to account for.
 function getGraphPoints(rideId) {
   var hist = loadHistory();
   var arr = hist.rides[rideId];
   if (!arr || arr.length < 2) return null;
-  arr = trimToCurrentSession(arr);
-  if (arr.length < 2) return null;
 
-  var sampled = arr;
-  if (arr.length > MAX_GRAPH_POINTS) {
-    sampled = [];
-    for (var i = 0; i < MAX_GRAPH_POINTS; i++) {
-      var idx = Math.round(i * (arr.length - 1) / (MAX_GRAPH_POINTS - 1));
-      sampled.push(arr[idx]);
-    }
+  var sessions = splitIntoSessions(arr);
+  var current = sessions[sessions.length - 1];
+  var older = sessions.slice(0, -1);
+
+  var oldMarkers = [];
+  for (var s = 0; s < older.length; s++) {
+    oldMarkers = oldMarkers.concat(downsample(older[s], GRAPH_OLD_SESSION_MAX_POINTS));
   }
+
+  var currentBudget = Math.max(2, MAX_GRAPH_POINTS - oldMarkers.length);
+  var sampled = oldMarkers.concat(downsample(current, currentBudget));
 
   var out = [];
   for (var j = 0; j < sampled.length; j++) {
