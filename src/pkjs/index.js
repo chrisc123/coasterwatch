@@ -428,16 +428,40 @@ function appendHistory(rides) {
   saveHistory(hist);
 }
 
+// Minutes between consecutive samples beyond which they're treated as
+// separate sessions rather than one continuous stretch of monitoring - well
+// above the normal ~5-15 min refresh cadence (REFRESH_INTERVAL_MS in
+// main.c, further stretched on low battery), so it only fires on a real
+// gap (app closed/backgrounded a while, watch put away), not just a slow
+// refresh tick.
+var GRAPH_SESSION_GAP_MINUTES = 60;
+
+// Drops everything before the LAST gap wider than GRAPH_SESSION_GAP_MINUTES,
+// so a stray earlier cluster of samples (e.g. testing the app at midnight,
+// then nothing until the park's actually open) doesn't drag the graph's
+// whole x-axis back to cover a long dead stretch, squeezing today's actual
+// data into a sliver at the end. `arr` is oldest-first [minute, wait] pairs.
+function trimToCurrentSession(arr) {
+  for (var i = arr.length - 1; i > 0; i--) {
+    if (arr[i][0] - arr[i - 1][0] > GRAPH_SESSION_GAP_MINUTES) {
+      return arr.slice(i);
+    }
+  }
+  return arr;
+}
+
 // Returns [{wait, minuteOfDay}, ...] oldest-first, downsampled to
-// MAX_GRAPH_POINTS, or null if fewer than 2 samples exist today. minuteOfDay
-// is the sample's actual clock time (0-1439) rather than an age, so the
-// watch can label the axis with real times (e.g. "09:15") instead of
-// "-85m" — history never spans midnight since it resets daily, so there's
-// no wraparound to account for.
+// MAX_GRAPH_POINTS, or null if fewer than 2 samples exist in the current
+// session (see trimToCurrentSession). minuteOfDay is the sample's actual
+// clock time (0-1439) rather than an age, so the watch can label the axis
+// with real times (e.g. "09:15") instead of "-85m" — history never spans
+// midnight since it resets daily, so there's no wraparound to account for.
 function getGraphPoints(rideId) {
   var hist = loadHistory();
   var arr = hist.rides[rideId];
   if (!arr || arr.length < 2) return null;
+  arr = trimToCurrentSession(arr);
+  if (arr.length < 2) return null;
 
   var sampled = arr;
   if (arr.length > MAX_GRAPH_POINTS) {

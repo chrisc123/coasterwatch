@@ -103,6 +103,63 @@ test('getGraphPoints downsamples to MAX_GRAPH_POINTS, preserving the first and l
   }
 });
 
+// getGraphPoints' history comes from real appendHistory() calls (real
+// nowMinutes()) in every other test here; these three need specific,
+// artificial minute-of-day gaps, so they seed queueHistory_v1 directly
+// instead. localTodayStr() duplicates todayStr()'s exact (unpadded) format
+// so the seeded entry reads as fresh, not stale-and-reset.
+function localTodayStr() {
+  const d = new Date();
+  return d.getFullYear() + '-' + (d.getMonth() + 1) + '-' + d.getDate();
+}
+
+test('getGraphPoints drops an earlier session separated by a long gap, keeping only the current one', () => {
+  const pkjs = loadPkjs({
+    storageSeed: {
+      queueHistory_v1: JSON.stringify({
+        date: localTodayStr(),
+        rides: {
+          [RIDE_A]: [
+            [2, 0], [5, 0], [8, 0], // messing around with the app around midnight
+            [600, 20], [605, 25], [610, 30], [615, 28], // today's actual session, from 10:00
+          ],
+        },
+      }),
+    },
+  });
+  const points = pkjs.getGraphPoints(RIDE_A);
+  assert.ok(points, 'expected a valid graph after trimming to the current session');
+  assert.strictEqual(points.length, 4, "only the current session's samples should remain");
+  assert.strictEqual(points[0].minuteOfDay, 600,
+    "the graph should start at the current session's first sample, not the midnight cluster");
+  assert.deepStrictEqual([...points.map((p) => p.wait)], [20, 25, 30, 28]);
+});
+
+test('getGraphPoints keeps everything when no gap exceeds the session threshold', () => {
+  const pkjs = loadPkjs({
+    storageSeed: {
+      queueHistory_v1: JSON.stringify({
+        date: localTodayStr(),
+        rides: { [RIDE_A]: [[600, 10], [610, 15], [620, 20]] }, // normal ~10 min refresh spacing
+      }),
+    },
+  });
+  const points = pkjs.getGraphPoints(RIDE_A);
+  assert.strictEqual(points.length, 3, 'nothing should be trimmed when every gap is within the normal refresh cadence');
+});
+
+test('getGraphPoints returns null if the current session alone has fewer than 2 samples', () => {
+  const pkjs = loadPkjs({
+    storageSeed: {
+      queueHistory_v1: JSON.stringify({
+        date: localTodayStr(),
+        rides: { [RIDE_A]: [[2, 0], [5, 0], [600, 20]] }, // only 1 sample survives the trim
+      }),
+    },
+  });
+  assert.strictEqual(pkjs.getGraphPoints(RIDE_A), null);
+});
+
 // ---------------------------------------------------------------------------
 // Park hours cross-check (the "Energylandia shows 0m while actually closed" bug)
 
