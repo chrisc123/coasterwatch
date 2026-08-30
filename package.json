@@ -8,7 +8,7 @@
   ],
   "private": true,
   "scripts": {
-    "test": "node test/settings-webview.test.js && node test/graphing.test.js"
+    "test": "node test/settings-webview.test.js && node test/graphing.test.js && node test/ride-logger.test.js"
   },
   "pebble": {
     "displayName": "CoasterWatch",
@@ -54,7 +54,27 @@
       "BandColor1",
       "BandColor2",
       "AlertColor",
-      "VibePattern"
+      "VibePattern",
+      "RideLogStart",
+      "RideLogChunk",
+      "RideLogEnd",
+      "RideLogRideName",
+      "RideLogRideId",
+      "RideLogDuration",
+      "RideLogMaxG",
+      "RideLogMinG",
+      "RideLogAirtimeMs",
+      "RideLogAirtimeHills",
+      "RideLogTurns",
+      "RideLogTotalSamples",
+      "RideLogAvgG",
+      "RideLogMaxAirtimeMs",
+      "RideLogHighGMs",
+      "RideLogRotationDeg",
+      "RideLogRoughness",
+      "RideLogSampleIntervalMs",
+      "RideLogTruncated",
+      "RideLogClipped"
     ],
     "resources": {
       "media": [

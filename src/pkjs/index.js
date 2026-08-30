@@ -5,6 +5,65 @@
 // endpoint), and streams everything to the watch.
 
 var Clay = require('@rebble/clay');
+var messageKeys;
+try { messageKeys = require('message_keys'); } catch (e) { messageKeys = {}; }
+
+var HARDCODED_KEYS = {
+  RequestRefresh: 10000,
+  RidesData: 10001,
+  TotalCount: 10002,
+  RideIndex: 10003,
+  RideId: 10004,
+  RideName: 10005,
+  RideWait: 10006,
+  RideDistance: 10007,
+  ErrorMsg: 10008,
+  RequestGraph: 10009,
+  GraphData: 10010,
+  GraphCount: 10011,
+  GraphIndex: 10012,
+  GraphWait: 10013,
+  GraphMinuteOfDay: 10014,
+  GraphError: 10015,
+  BandThreshold1: 10016,
+  BandThreshold2: 10017,
+  BandColor0: 10018,
+  BandColor1: 10019,
+  BandColor2: 10020,
+  AlertColor: 10021,
+  VibePattern: 10022,
+  RideLogStart: 10023,
+  RideLogChunk: 10024,
+  RideLogEnd: 10025,
+  RideLogRideName: 10026,
+  RideLogRideId: 10027,
+  RideLogDuration: 10028,
+  RideLogMaxG: 10029,
+  RideLogMinG: 10030,
+  RideLogAirtimeMs: 10031,
+  RideLogAirtimeHills: 10032,
+  RideLogTurns: 10033,
+  RideLogTotalSamples: 10034,
+  RideLogAvgG: 10035,
+  RideLogMaxAirtimeMs: 10036,
+  RideLogHighGMs: 10037,
+  RideLogRotationDeg: 10038,
+  RideLogRoughness: 10039,
+  RideLogSampleIntervalMs: 10040,
+  RideLogTruncated: 10041,
+  RideLogClipped: 10042
+};
+
+function getMsgValue(dict, keyName) {
+  if (!dict) return undefined;
+  if (dict[keyName] !== undefined) return dict[keyName];
+  var numKey = (messageKeys && messageKeys[keyName]) || HARDCODED_KEYS[keyName];
+  if (numKey !== undefined) {
+    if (dict[numKey] !== undefined) return dict[numKey];
+    if (dict[String(numKey)] !== undefined) return dict[String(numKey)];
+  }
+  return undefined;
+}
 
 var PARK_KEY = 'selectedParkId';
 var DEFAULT_PARK_ID = 317; // Energylandia — preserves existing installs' behavior
@@ -299,6 +358,16 @@ function flattenRides(data) {
 // ---------------------------------------------------------------------------
 // Location & distance
 
+// Last successful GPS fix, kept so a ride log can be stamped with a location
+// without waiting on its own (slow, and possibly denied) geolocation call —
+// stopping a recording has to persist immediately. Refreshed by every queue
+// refresh, so in practice it's minutes old at worst. Deliberately stored with
+// `latitude`/`longitude` names: that's the shape the ride-log/CSV/GeoJSON
+// consumers use, whereas getLocation's own callback speaks `lat`/`lng` for
+// the distance maths. Null until the first fix (or forever, if the phone
+// refuses location) — every reader must handle that.
+var s_cached_location = null;
+
 function getLocation(cb) {
   if (!navigator.geolocation) { cb(null); return; }
   var done = false;
@@ -309,6 +378,7 @@ function getLocation(cb) {
     if (done) return;
     done = true;
     clearTimeout(timer);
+    s_cached_location = { latitude: pos.coords.latitude, longitude: pos.coords.longitude };
     cb({ lat: pos.coords.latitude, lng: pos.coords.longitude });
   }, function () {
     if (done) return;
@@ -534,8 +604,39 @@ function arraysEqual(a, b) {
   return true;
 }
 
+// Ride ids with at least one telemetry recording saved today, so the grid can
+// mark them. Date comparison lives here rather than on the watch because the
+// phone owns anything timezone-aware — todayStr() is local-time, and matches
+// the convention the queue history already uses.
+function ridesLoggedToday() {
+  var set = {};
+  try {
+    var logs = JSON.parse(localStorage.getItem('coasterwatch_ride_logs') || '[]');
+    var today = todayStr();
+    for (var i = 0; i < logs.length; i++) {
+      var r = logs[i];
+      if (r.rideId === undefined || r.rideId === null || !r.recordedAt) continue;
+      var d = new Date(r.recordedAt);
+      if (isNaN(d.getTime())) continue;
+      var stamp = d.getFullYear() + '-' + (d.getMonth() + 1) + '-' + d.getDate();
+      if (stamp === today) set[String(r.rideId)] = true;
+    }
+  } catch (e) { /* a corrupt store just means no ticks */ }
+  return set;
+}
+
+// Per-ride flag bits in the RidesData wire format. Bit 0 is "logged today";
+// the byte exists so the next one of these doesn't need another format change.
+var RIDE_FLAG_LOGGED_TODAY = 1;
+
+// The last list actually sent, so a finished recording can re-send with the
+// tick flag flipped without waiting for (or paying for) a network refresh.
+var s_last_rides_sent = null;
+
 function sendRidesToWatch(rides, forceSend) {
   var capped = rides.slice(0, MAX_RIDES);
+  s_last_rides_sent = capped;
+  var loggedToday = ridesLoggedToday();
   var bytes = [capped.length];
   for (var i = 0; i < capped.length; i++) {
     var r = capped[i];
@@ -545,6 +646,7 @@ function sendRidesToWatch(rides, forceSend) {
     bytes.push((w >> 8) & 0xFF, w & 0xFF);
     var d = (r._distance !== undefined) ? r._distance : -1;
     bytes.push((d >> 24) & 0xFF, (d >> 16) & 0xFF, (d >> 8) & 0xFF, d & 0xFF);
+    bytes.push(loggedToday[String(id)] ? RIDE_FLAG_LOGGED_TODAY : 0);
     var nameStr = cleanName(r.name);
     var utf8Name = unescape(encodeURIComponent(nameStr));
     bytes.push(utf8Name.length);
@@ -772,6 +874,411 @@ function fetchQueueTimes(forceSend) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Ride Sensor Logger & 3D Telemetry Session Management
+
+var s_active_ride_session = null;
+
+function buildCsvString(ride) {
+  if (!ride) return '';
+  var csvRows = ['timestamp_ms,accel_x,accel_y,accel_z,total_g,heading_deg,latitude,longitude'];
+  var lat = (ride.gps && ride.gps.lat) ? ride.gps.lat : '';
+  var lon = (ride.gps && ride.gps.lon) ? ride.gps.lon : '';
+  if (ride.samples) {
+    ride.samples.forEach(function (s) {
+      csvRows.push([s[0], s[1], s[2], s[3], s[4], s[5], lat, lon].join(','));
+    });
+  }
+  return csvRows.join('\n');
+}
+
+function downsamplePoints(pts, maxPts) {
+  if (!pts || pts.length <= maxPts) return pts || [];
+  var out = [];
+  var step = (pts.length - 1) / (maxPts - 1.0);
+  for (var k = 0; k < maxPts; k++) {
+    out.push(pts[Math.floor(k * step)]);
+  }
+  return out;
+}
+
+function persistRideLogs(session) {
+  if (!session) return;
+  try {
+    var compactSession = {
+      id: session.id,
+      rideId: session.rideId,
+      rideName: session.rideName,
+      park: session.park,
+      recordedAt: session.recordedAt,
+      durationSec: session.durationSec,
+      sampleRateHz: session.sampleRateHz,
+      sampleIntervalMs: session.sampleIntervalMs,
+      truncated: session.truncated,
+      clippedSamples: session.clippedSamples,
+      summary: session.summary,
+      gps: session.gps,
+      githubUrl: session.githubUrl,
+      githubSynced: session.githubSynced,
+      samples: (session.samples && session.samples.length > 200) ? downsamplePoints(session.samples, 200) : (session.samples || [])
+    };
+
+    var existing = JSON.parse(localStorage.getItem('coasterwatch_ride_logs') || '[]');
+    var foundIdx = -1;
+    for (var i = 0; i < existing.length; i++) {
+      if (existing[i].id === compactSession.id) {
+        foundIdx = i;
+        break;
+      }
+    }
+    if (foundIdx >= 0) {
+      existing[foundIdx] = compactSession;
+    } else {
+      existing.unshift(compactSession);
+    }
+    if (existing.length > 10) existing = existing.slice(0, 10);
+    localStorage.setItem('coasterwatch_ride_logs', JSON.stringify(existing));
+    console.log('CoasterWatch: Persisted ride log for ' + compactSession.rideName + ' (total rides: ' + existing.length + ')');
+  } catch (e) {
+    console.log('CoasterWatch: Failed to persist ride log: ' + e);
+  }
+}
+
+// Removes rides from this phone's store. GitHub copies are deliberately left
+// alone — the repo is an archive, and someone clearing space on their phone
+// has not asked to destroy their uploaded telemetry. Returns how many went.
+function deleteRideLogs(ids) {
+  if (!ids || !ids.length) return 0;
+  var doomed = {};
+  for (var i = 0; i < ids.length; i++) doomed[String(ids[i])] = true;
+  try {
+    var existing = JSON.parse(localStorage.getItem('coasterwatch_ride_logs') || '[]');
+    var kept = existing.filter(function (r) { return !doomed[String(r.id)]; });
+    var removed = existing.length - kept.length;
+    if (removed > 0) localStorage.setItem('coasterwatch_ride_logs', JSON.stringify(kept));
+    return removed;
+  } catch (e) {
+    console.log('CoasterWatch: Failed to delete ride logs: ' + e);
+    return 0;
+  }
+}
+
+function handleRideLogStart(dict) {
+  var rideId = getMsgValue(dict, 'RideLogRideId');
+  var rideName = getMsgValue(dict, 'RideLogRideName') || 'Coaster';
+  var durationSec = getMsgValue(dict, 'RideLogDuration') || 0;
+  var maxGVal = getMsgValue(dict, 'RideLogMaxG');
+  var minGVal = getMsgValue(dict, 'RideLogMinG');
+  var maxG = (maxGVal !== undefined ? maxGVal : 1000) / 1000.0;
+  var minG = (minGVal !== undefined ? minGVal : 1000) / 1000.0;
+  var avgGVal = getMsgValue(dict, 'RideLogAvgG');
+  var avgG = (avgGVal !== undefined ? avgGVal : 0) / 1000.0;
+  var airtimeMs = getMsgValue(dict, 'RideLogAirtimeMs') || 0;
+  var airtimeHills = getMsgValue(dict, 'RideLogAirtimeHills') || 0;
+  var maxAirtimeMs = getMsgValue(dict, 'RideLogMaxAirtimeMs') || 0;
+  var highGMs = getMsgValue(dict, 'RideLogHighGMs') || 0;
+  var turns = getMsgValue(dict, 'RideLogTurns') || 0;
+  var rotationDeg = getMsgValue(dict, 'RideLogRotationDeg') || 0;
+  var roughness = getMsgValue(dict, 'RideLogRoughness') || 0;
+  var truncated = !!getMsgValue(dict, 'RideLogTruncated');
+  var clippedSamples = getMsgValue(dict, 'RideLogClipped') || 0;
+  var totalSamples = getMsgValue(dict, 'RideLogTotalSamples') || 0;
+
+  // The watch measures its own mean sample interval (in tenths of a ms) rather
+  // than us assuming the nominal 25Hz, so exported timestamps reflect what the
+  // accelerometer actually did. Fall back to 40ms if it's absent or absurd.
+  var intervalTenths = getMsgValue(dict, 'RideLogSampleIntervalMs');
+  var sampleIntervalMs = 40;
+  if (intervalTenths && intervalTenths >= 40 && intervalTenths <= 2000) {
+    sampleIntervalMs = intervalTenths / 10.0;
+  }
+
+  var activePark = getActivePark();
+  var parkName = (activePark && activePark.name) ? activePark.name : 'Theme Park';
+
+  s_active_ride_session = {
+    id: 'ride_' + Date.now() + '_' + (rideId !== undefined ? rideId : 'gen'),
+    rideId: rideId,
+    rideName: rideName,
+    park: parkName,
+    recordedAt: new Date().toISOString(),
+    durationSec: durationSec,
+    sampleIntervalMs: sampleIntervalMs,
+    sampleRateHz: Math.round(10000 / sampleIntervalMs) / 10,
+    truncated: truncated,
+    // Samples where an axis sat on the accelerometer's +/-4g rail, so the peak
+    // is a floor rather than a measurement.
+    clippedSamples: clippedSamples,
+    summary: {
+      // maxG/minG/avgG are acceleration *magnitudes* in g. minG therefore
+      // bottoms out at 0 (free-fall) and is never negative — the watch has no
+      // gyro, so it cannot resolve signed vertical G. See tracker_summary_min_g
+      // in src/c/main.c.
+      maxG: maxG,
+      minG: minG,
+      avgG: avgG,
+      airtimeSec: Math.round((airtimeMs / 1000.0) * 10) / 10,
+      airtimeHills: airtimeHills,
+      maxAirtimeSec: Math.round((maxAirtimeMs / 1000.0) * 10) / 10,
+      highGSec: Math.round((highGMs / 1000.0) * 10) / 10,
+      // Yaw turns of >=90 degrees, and total yaw swept. NOT inversions: a
+      // compass bearing cannot see a loop (same bearing in and out) and would
+      // flag a flat helix instead.
+      turns: turns,
+      rotationDeg: rotationDeg,
+      // Mean |d|a|/dt| in mg/s — how rattly the ride was.
+      roughness: roughness,
+      totalSamples: totalSamples
+    },
+    gps: s_cached_location ? {
+      lat: s_cached_location.latitude,
+      lon: s_cached_location.longitude
+    } : null,
+    samples: []
+  };
+  console.log('CoasterWatch: Started ride log for ' + rideName + ' (expected ' + totalSamples + ' samples)');
+  persistRideLogs(s_active_ride_session);
+}
+
+// AppMessage byte arrays do not arrive as the same JS type everywhere, so
+// dispatch on array-*likeness* rather than on `typeof`/`Array.isArray`:
+//
+//   real phone      -> a genuine Array (or a typed array)
+//   pypkjs emulator -> a `JSArray`, STPyV8's wrapper around the Python list.
+//                      It has .length and numeric indices and works with
+//                      Array.prototype.slice, but Array.isArray() is false
+//                      and `typeof` reports "function" (!), not "object".
+//
+// That last quirk is what made the old `typeof data === 'object'` branch fall
+// straight through to `return []`, so every RideLogChunk decoded to zero
+// samples and rides synced with metadata but no telemetry. Test the shape,
+// not the tag.
+function toByteArray(data) {
+  if (!data) return [];
+  if (Array.isArray(data)) return data;
+
+  // Strings have .length too, so they must be handled before the array-like
+  // check below.
+  if (typeof data === 'string') {
+    var strArr = [];
+    for (var s = 0; s < data.length; s++) {
+      strArr.push(data.charCodeAt(s) & 0xFF);
+    }
+    return strArr;
+  }
+
+  if (data instanceof ArrayBuffer) {
+    return Array.prototype.slice.call(new Uint8Array(data));
+  }
+  if (data.buffer instanceof ArrayBuffer) {
+    // Typed-array view: honour byteOffset/byteLength rather than re-reading
+    // the whole backing buffer.
+    return Array.prototype.slice.call(
+        new Uint8Array(data.buffer, data.byteOffset || 0,
+                       data.byteLength !== undefined ? data.byteLength : undefined));
+  }
+
+  // Anything array-like: real Arrays are already handled, this catches the
+  // emulator's JSArray and any host wrapper that walks like an array.
+  if (typeof data.length === 'number' && data.length >= 0) {
+    return Array.prototype.slice.call(data);
+  }
+
+  // Last resort: a plain object with numeric keys.
+  if (typeof data === 'object' || typeof data === 'function') {
+    var arr = [];
+    var keys = Object.keys(data);
+    for (var i = 0; i < keys.length; i++) {
+      var k = keys[i];
+      if (!isNaN(k)) {
+        arr[parseInt(k, 10)] = data[k];
+      }
+    }
+    return arr;
+  }
+  return [];
+}
+
+function handleRideLogChunk(rawBytes) {
+  var bytes = toByteArray(rawBytes);
+  if (!bytes || bytes.length < 3) return;
+
+  if (!s_active_ride_session) {
+    handleRideLogStart({});
+  }
+
+  var seq = (bytes[0] << 8) | bytes[1];
+  var count = bytes[2];
+  var offset = 3;
+
+  for (var i = 0; i < count && offset + 8 <= bytes.length; i++) {
+    var ax = (bytes[offset] << 8) | bytes[offset + 1];
+    if (ax >= 32768) ax -= 65536;
+    var ay = (bytes[offset + 2] << 8) | bytes[offset + 3];
+    if (ay >= 32768) ay -= 65536;
+    var az = (bytes[offset + 4] << 8) | bytes[offset + 5];
+    if (az >= 32768) az -= 65536;
+    var heading = ((bytes[offset + 6] << 8) | bytes[offset + 7]) / 10.0;
+    offset += 8;
+
+    var intervalMs = s_active_ride_session.sampleIntervalMs || 40;
+    var tMs = Math.round((seq + i) * intervalMs);
+    var totalG = Math.sqrt(ax * ax + ay * ay + az * az) / 1000.0;
+    s_active_ride_session.samples.push([tMs, ax, ay, az, Math.round(totalG * 100) / 100, heading]);
+  }
+  if (s_active_ride_session.samples.length % 500 === 0) {
+    persistRideLogs(s_active_ride_session);
+  }
+}
+
+var GITHUB_TOKEN_KEY = 'github_sync_token';
+var GITHUB_REPO_KEY = 'github_sync_repo';
+var GITHUB_ENABLED_KEY = 'github_sync_enabled';
+
+// Defaults ON so an existing configured install keeps syncing after this
+// toggle was introduced — only an explicit "0" turns it off.
+function isGitHubSyncEnabled() {
+  return localStorage.getItem(GITHUB_ENABLED_KEY) !== '0';
+}
+// Empty by default: the real value lives in this phone's localStorage, set
+// once from the settings page. Hardcoding a personal repo here would ship it
+// as every other installer's default.
+var DEFAULT_GITHUB_REPO = '';
+var DEFAULT_GITHUB_TOKEN = '';
+
+function utf8ToBase64(str) {
+  if (typeof btoa === 'function') {
+    try {
+      return btoa(unescape(encodeURIComponent(str)));
+    } catch (e) {}
+  }
+  var chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=';
+  var encoded = [];
+  var c1, c2, c3, e1, e2, e3, e4;
+  var utf8 = [];
+  for (var i = 0; i < str.length; i++) {
+    var c = str.charCodeAt(i);
+    if (c < 128) utf8.push(c);
+    else if (c < 2048) {
+      utf8.push((c >> 6) | 192);
+      utf8.push((c & 63) | 128);
+    } else {
+      utf8.push((c >> 12) | 224);
+      utf8.push(((c >> 6) & 63) | 128);
+      utf8.push((c & 63) | 128);
+    }
+  }
+  var pos = 0;
+  while (pos < utf8.length) {
+    c1 = utf8[pos++];
+    c2 = utf8[pos++];
+    c3 = utf8[pos++];
+    e1 = c1 >> 2;
+    e2 = ((c1 & 3) << 4) | (c2 >> 4);
+    e3 = isNaN(c2) ? 64 : (((c2 & 15) << 2) | (c3 >> 6));
+    e4 = isNaN(c2) || isNaN(c3) ? 64 : (c3 & 63);
+    encoded.push(chars.charAt(e1), chars.charAt(e2), chars.charAt(e3), chars.charAt(e4));
+  }
+  return encoded.join('');
+}
+
+function uploadFileToGitHubRepo(repo, token, path, content, message, cb) {
+  var url = 'https://api.github.com/repos/' + repo + '/contents/' + path;
+  var body = JSON.stringify({
+    message: message,
+    content: utf8ToBase64(content)
+  });
+
+  var xhr = new XMLHttpRequest();
+  xhr.open('PUT', url, true);
+  var authHeader = (token.indexOf('Bearer ') === 0 || token.indexOf('token ') === 0) ? token : 'Bearer ' + token;
+  xhr.setRequestHeader('Authorization', authHeader);
+  xhr.setRequestHeader('Accept', 'application/vnd.github.v3+json');
+  xhr.setRequestHeader('Content-Type', 'application/json');
+  xhr.timeout = 25000;
+
+  xhr.onload = function () {
+    if (xhr.status >= 200 && xhr.status < 300) {
+      cb(true, null);
+    } else {
+      cb(false, 'HTTP ' + xhr.status + ': ' + xhr.responseText);
+    }
+  };
+  xhr.onerror = function () { cb(false, 'Network error'); };
+  xhr.ontimeout = function () { cb(false, 'Timeout'); };
+  xhr.send(body);
+}
+
+function uploadRideToGitHub(session, callback) {
+  if (!session) return;
+  if (!isGitHubSyncEnabled()) {
+    console.log('CoasterWatch: Cloud sync is off — ride saved locally only.');
+    if (callback) callback(false, 'Cloud sync disabled');
+    return;
+  }
+  var token = localStorage.getItem(GITHUB_TOKEN_KEY) || DEFAULT_GITHUB_TOKEN;
+  var repo = localStorage.getItem(GITHUB_REPO_KEY) || DEFAULT_GITHUB_REPO;
+  if (!token || !repo) {
+    // Logged rather than swallowed: an unconfigured token is indistinguishable
+    // from a working sync otherwise — the watch still says "Saved" (that only
+    // reports the watch->phone leg), so the only symptom is an empty repo.
+    console.log('CoasterWatch: Skipping GitHub sync — no ' +
+                (!token ? 'token' : 'repo') + ' configured. Set one in the app settings page.');
+    if (callback) callback(false, 'No GitHub token configured');
+    return;
+  }
+
+  var safeName = (session.rideName || 'ride').replace(/[^a-z0-9]/gi, '_').toLowerCase();
+  var dateTag = new Date(session.recordedAt || Date.now()).toISOString().replace(/[:.]/g, '-');
+  var baseFilename = safeName + '_' + dateTag;
+
+  var csvContent = buildCsvString(session);
+  var jsonContent = JSON.stringify(session, null, 2);
+
+  var csvPath = 'rides/' + baseFilename + '.csv';
+  var jsonPath = 'rides/' + baseFilename + '.json';
+
+  console.log('CoasterWatch: Auto-syncing ' + csvPath + ' to GitHub ' + repo + '...');
+
+  uploadFileToGitHubRepo(repo, token, csvPath, csvContent, 'Add telemetry CSV for ' + (session.rideName || 'Ride'), function (okCsv, errCsv) {
+    if (!okCsv) {
+      console.log('CoasterWatch: Failed to upload CSV to GitHub: ' + errCsv);
+      if (callback) callback(false, errCsv);
+      return;
+    }
+    uploadFileToGitHubRepo(repo, token, jsonPath, jsonContent, 'Add telemetry 3D JSON for ' + (session.rideName || 'Ride'), function (okJson, errJson) {
+      if (okJson) {
+        console.log('CoasterWatch: Successfully synced ' + baseFilename + ' to GitHub!');
+        var commitUrl = 'https://github.com/' + repo + '/tree/main/rides';
+        session.githubUrl = commitUrl;
+        session.githubSynced = true;
+        persistRideLogs(session);
+        if (callback) callback(true, commitUrl);
+      } else {
+        if (callback) callback(true, 'CSV uploaded');
+      }
+    });
+  });
+}
+
+function handleRideLogEnd() {
+  if (!s_active_ride_session) {
+    handleRideLogStart({});
+  }
+  if (!s_active_ride_session) return;
+  persistRideLogs(s_active_ride_session);
+  console.log('CoasterWatch: Saved complete ride log for ' + s_active_ride_session.rideName +
+              ' with ' + s_active_ride_session.samples.length + ' raw samples.');
+  
+  uploadRideToGitHub(s_active_ride_session);
+  s_active_ride_session = null;
+
+  // Push the grid's "logged today" ticks straight away. Re-packing the list we
+  // already hold is free; waiting for the next queue refresh would leave the
+  // ride you just recorded looking unlogged for minutes.
+  if (s_last_rides_sent) sendRidesToWatch(s_last_rides_sent, true);
+}
+
 Pebble.addEventListener('ready', function () {
   console.log('CoasterWatch: PebbleKit JS ready');
   sendBandConfig();
@@ -779,11 +1286,26 @@ Pebble.addEventListener('ready', function () {
 });
 
 Pebble.addEventListener('appmessage', function (e) {
-  if (e.payload && e.payload['RequestRefresh'] !== undefined) {
+  var dict = (e && (e.payload || e.data)) || e || {};
+  var reqRefresh = getMsgValue(dict, 'RequestRefresh');
+  if (reqRefresh !== undefined) {
     fetchQueueTimes(true);
   }
-  if (e.payload && e.payload['RequestGraph'] !== undefined) {
-    sendGraph(e.payload['RequestGraph']);
+  var reqGraph = getMsgValue(dict, 'RequestGraph');
+  if (reqGraph !== undefined) {
+    sendGraph(reqGraph);
+  }
+  var logStart = getMsgValue(dict, 'RideLogStart');
+  if (logStart !== undefined) {
+    handleRideLogStart(dict);
+  }
+  var logChunk = getMsgValue(dict, 'RideLogChunk');
+  if (logChunk !== undefined) {
+    handleRideLogChunk(logChunk);
+  }
+  var logEnd = getMsgValue(dict, 'RideLogEnd');
+  if (logEnd !== undefined) {
+    handleRideLogEnd(dict);
   }
 });
 
@@ -1052,6 +1574,515 @@ var RIDE_LIST_COMPONENT = {
   }
 };
 
+// Cloud sync lives inside the Ride Recordings section, because it exists only
+// to serve recordings — it has no meaning on its own. It's set-once config, so
+// the common action (toggling sync) sits on the summary row at one tap, and
+// the credentials hide behind a disclosure rather than occupying prime space
+// above the data they serve.
+//
+// Note the root element carries NO `section` class: buildClayConfig() puts
+// this inside a Clay section already, and declaring it here too produced a
+// section-within-a-section with doubled padding and borders.
+var GITHUB_SYNC_COMPONENT = {
+  name: 'githubsync',
+  template: '<div class="component component-githubsync gh-wrap">' +
+              '<div class="gh-row">' +
+                '<label class="gh-toggle">' +
+                  '<input type="checkbox" id="ghSyncEnabled" />' +
+                  '<span>Auto-sync to GitHub</span>' +
+                '</label>' +
+                '<button type="button" id="ghDisclose" class="rl-btn rl-btn-ghost">Set up</button>' +
+              '</div>' +
+              '<div id="ghSummary" class="gh-summary"></div>' +
+              '<div id="ghCreds" class="gh-creds" style="display:none;">' +
+                '<label class="gh-lab">Personal access token</label>' +
+                '<input type="password" id="ghSyncToken" class="gh-input" placeholder="ghp_... or github_pat_..." />' +
+                '<label class="gh-lab">Repository (owner/repo)</label>' +
+                '<input type="text" id="ghSyncRepo" class="gh-input" placeholder="owner/repo" />' +
+                '<div class="gh-test">' +
+                  '<button type="button" id="ghTestBtn" class="rl-btn rl-btn-ghost">Test connection</button>' +
+                  '<span id="ghTestStatus" class="gh-status"></span>' +
+                '</div>' +
+              '</div>' +
+            '</div>',
+  style: '.gh-wrap{border-top:1px solid #3a3a3a;margin-top:10px;padding-top:10px;}' +
+         '.gh-row{display:flex;align-items:center;justify-content:space-between;gap:8px;}' +
+         '.gh-toggle{display:flex;align-items:center;gap:9px;cursor:pointer;color:#fff;font-size:13px;}' +
+         '.gh-toggle input{width:18px;height:18px;flex:none;}' +
+         '.gh-summary{color:#888;font-size:11px;margin-top:4px;line-height:1.4;}' +
+         '.gh-creds{margin-top:10px;}' +
+         '.gh-lab{font-size:11px;color:#bbb;display:block;margin-bottom:4px;}' +
+         '.gh-input{width:100%;box-sizing:border-box;background:#333;color:#fff;border:1px solid #555;' +
+           'border-radius:4px;padding:8px;font-size:13px;margin-bottom:9px;}' +
+         '.gh-test{display:flex;align-items:center;gap:8px;}' +
+         '.gh-status{font-size:11px;}',
+  manipulator: {
+    get: function () {
+      var root = this.$element[0];
+      var tokenEl = root.querySelector('#ghSyncToken');
+      var repoEl = root.querySelector('#ghSyncRepo');
+      var enabledEl = root.querySelector('#ghSyncEnabled');
+      return {
+        enabled: enabledEl ? !!enabledEl.checked : true,
+        token: tokenEl ? tokenEl.value : '',
+        repo: repoEl ? repoEl.value : ''
+      };
+    },
+    set: function (val) {
+      if (!val) return;
+      var root = this.$element[0];
+      var tokenEl = root.querySelector('#ghSyncToken');
+      var repoEl = root.querySelector('#ghSyncRepo');
+      var enabledEl = root.querySelector('#ghSyncEnabled');
+      if (tokenEl && val.token !== undefined) tokenEl.value = val.token;
+      if (repoEl && val.repo !== undefined) repoEl.value = val.repo;
+      if (enabledEl && val.enabled !== undefined) enabledEl.checked = !!val.enabled;
+    }
+  },
+  initialize: function () {
+    var self = this;
+    var root = self.$element[0];
+    var tokenEl = root.querySelector('#ghSyncToken');
+    var repoEl = root.querySelector('#ghSyncRepo');
+    var enabledEl = root.querySelector('#ghSyncEnabled');
+    var credsEl = root.querySelector('#ghCreds');
+    var discloseEl = root.querySelector('#ghDisclose');
+    var summaryEl = root.querySelector('#ghSummary');
+    var testBtn = root.querySelector('#ghTestBtn');
+    var testStatus = root.querySelector('#ghTestStatus');
+
+    if (tokenEl) tokenEl.value = self.config.token || '';
+    if (repoEl) repoEl.value = self.config.repo || '';
+    if (enabledEl) enabledEl.checked = self.config.enabled !== false;
+
+    // One line saying what will actually happen, so the state is legible
+    // without opening the disclosure.
+    function refreshSummary() {
+      if (!summaryEl) return;
+      var on = enabledEl && enabledEl.checked;
+      var repo = (repoEl && repoEl.value.trim()) || '';
+      if (!on) {
+        summaryEl.textContent = 'Off — recordings stay on this phone.';
+      } else if (!tokenEl || !tokenEl.value.trim()) {
+        summaryEl.textContent = 'On, but no token set yet — tap Set up.';
+      } else {
+        summaryEl.textContent = 'Each recording is committed to ' + (repo || 'your repo') + '.';
+      }
+    }
+    if (enabledEl) enabledEl.onchange = refreshSummary;
+    if (repoEl) repoEl.oninput = refreshSummary;
+    if (tokenEl) tokenEl.oninput = refreshSummary;
+    refreshSummary();
+
+    if (discloseEl && credsEl) {
+      discloseEl.onclick = function (ev) {
+        ev.preventDefault();
+        var open = credsEl.style.display !== 'none';
+        credsEl.style.display = open ? 'none' : '';
+        discloseEl.textContent = open ? 'Set up' : 'Done';
+      };
+    }
+
+    if (testBtn) {
+      testBtn.onclick = function (e) {
+        e.preventDefault();
+        var tok = (tokenEl ? tokenEl.value : '').trim();
+        var rep = (repoEl ? repoEl.value : '').trim();
+        if (!tok || !rep) {
+          testStatus.style.color = '#ffaa00';
+          testStatus.textContent = 'Enter a token and repo first';
+          return;
+        }
+        testStatus.style.color = '#7ab8ff';
+        testStatus.textContent = 'Testing...';
+
+        var authHeader = (tok.indexOf('Bearer ') === 0 || tok.indexOf('token ') === 0) ? tok : 'Bearer ' + tok;
+        var xhr = new XMLHttpRequest();
+        xhr.open('GET', 'https://api.github.com/repos/' + rep, true);
+        xhr.setRequestHeader('Authorization', authHeader);
+        xhr.setRequestHeader('Accept', 'application/vnd.github.v3+json');
+        xhr.timeout = 15000;
+        xhr.onload = function () {
+          if (xhr.status === 200) {
+            testStatus.style.color = '#4caf50';
+            testStatus.textContent = '\u2713 Connected';
+          } else if (xhr.status === 401) {
+            testStatus.style.color = '#e53935';
+            testStatus.textContent = '\u2715 401: invalid token';
+          } else if (xhr.status === 404) {
+            testStatus.style.color = '#e53935';
+            testStatus.textContent = '\u2715 404: repo not found / needs Contents permission';
+          } else if (xhr.status === 403) {
+            testStatus.style.color = '#e53935';
+            testStatus.textContent = '\u2715 403: forbidden';
+          } else {
+            testStatus.style.color = '#e53935';
+            testStatus.textContent = '\u2715 HTTP ' + xhr.status;
+          }
+        };
+        xhr.onerror = function () {
+          testStatus.style.color = '#e53935';
+          testStatus.textContent = '\u2715 Network error';
+        };
+        xhr.ontimeout = function () {
+          testStatus.style.color = '#e53935';
+          testStatus.textContent = '\u2715 Timeout';
+        };
+        xhr.send();
+      };
+    }
+  }
+};
+
+var RIDE_LOGS_COMPONENT = {
+  name: 'ridelogs',
+  // No `section` class on the root: buildClayConfig() already wraps this in a
+  // Clay section, and having both produced a section-within-a-section with
+  // doubled padding and borders — which is what made this block read as
+  // something bundled inside Rides rather than a peer of it. The section
+  // heading is now a real Clay `heading` item too, so it matches Park /
+  // Tile Colours / Alerts instead of inventing its own type scale.
+  template: '<div id="rideLogsSection">' +
+              '<div class="rl-title">' +
+                '<span class="rl-subtle"><span id="rideLogsCount">0</span> saved on this phone</span>' +
+                '<button type="button" id="rlClearAll" class="rl-btn rl-btn-ghost">Delete all</button>' +
+              '</div>' +
+              '<div id="rlPending" class="rl-pending" style="display:none;"></div>' +
+              '<div id="rideLogsContainer"></div>' +
+            '</div>',
+  style: '.rl-card{background:#26262b;border:1px solid #3d3d44;border-radius:9px;padding:12px 12px 10px;margin-bottom:10px;box-shadow:0 2px 6px rgba(0,0,0,0.25);box-sizing:border-box;width:100%;}' +
+         '.rl-head{display:flex;align-items:baseline;justify-content:space-between;gap:8px;}' +
+         '.rl-name{font-weight:700;color:#f4f4f5;font-size:15px;}' +
+         '.rl-chip{font-size:10px;font-weight:600;border-radius:12px;padding:2px 8px;background:#35353d;color:#a1a1aa;white-space:nowrap;}' +
+         '.rl-chip-ok{background:#143820;color:#4ade80;border:1px solid #1e5a32;}' +
+         '.rl-meta{color:#94949e;font-size:11px;margin-top:3px;}' +
+         '.rl-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-top:10px;}' +
+         '.rl-cell{background:#1e1e22;border:1px solid #333338;border-radius:6px;padding:7px 5px;text-align:center;display:flex;flex-direction:column;justify-content:center;align-items:center;min-height:50px;box-sizing:border-box;}' +
+         '.rl-val{color:#fff;font-size:15px;font-weight:700;line-height:1.15;letter-spacing:-0.2px;}' +
+         '.rl-lab{color:#9e9ea4;font-size:9.5px;font-weight:600;text-transform:uppercase;letter-spacing:0.3px;margin-top:3px;line-height:1.25;text-align:center;word-break:break-word;}' +
+         '.rl-warn{color:#ffb74d;background:#2d2415;border:1px solid #543e18;border-radius:5px;padding:6px 8px;font-size:11px;margin-top:8px;line-height:1.35;}' +
+         '.rl-btns{display:flex !important;flex-direction:row !important;flex-wrap:nowrap !important;align-items:stretch !important;gap:6px !important;width:100% !important;box-sizing:border-box !important;margin-top:10px !important;padding-top:8px !important;border-top:1px solid #333338 !important;}' +
+         '.rl-btn{flex:1 !important;min-width:0 !important;width:auto !important;max-width:none !important;background:#2a313d !important;color:#e2e8f0 !important;border:1px solid #4a5568 !important;border-radius:5px !important;padding:7px 2px !important;font-size:11px !important;font-weight:600 !important;line-height:1.2 !important;text-align:center !important;cursor:pointer !important;white-space:nowrap !important;overflow:hidden !important;text-overflow:ellipsis !important;box-sizing:border-box !important;touch-action:manipulation;transition:background 0.15s,border-color 0.15s;}' +
+         '.rl-btn:active{background:#3b4657 !important;}' +
+         '.rl-count{color:#8a8a93;font-size:10.5px;white-space:nowrap;}' +
+         '.rl-empty{color:#aaa;font-size:12px;padding:12px 0;line-height:1.5;}' +
+         '.rl-title{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:12px;}' +
+         '.rl-btn-ghost{flex:0 0 auto !important;background:transparent !important;border:1px solid #555 !important;color:#ccc !important;padding:5px 10px !important;display:inline-flex !important;width:auto !important;}' +
+         '.rl-btn-del{flex:1 !important;min-width:0 !important;background:transparent !important;border:1px solid #742a2a !important;color:#f87171 !important;margin-left:0 !important;padding:7px 2px !important;text-align:center !important;}' +
+         '.rl-btn-del:active{background:rgba(185,28,28,0.2) !important;}' +
+         '.rl-pending{background:#3a2f14;border:1px solid #6b5520;border-radius:6px;color:#ffcc66;font-size:11px;padding:8px 10px;margin-bottom:10px;line-height:1.4;}' +
+         '.rl-card.rl-doomed{opacity:.45;}' +
+         '.rl-card.rl-doomed .rl-name{text-decoration:line-through;}',
+  manipulator: {
+    // The settings page is a separate JS context from PKJS with its own
+    // localStorage, so it cannot delete anything itself. The ids marked for
+    // deletion travel home in the save response and the webviewclosed handler
+    // does the actual removal. That is also why the UI says "on Save" rather
+    // than deleting on the spot — pretending otherwise would be a lie the
+    // moment someone backed out without saving.
+    get: function () {
+      var root = this.$element[0];
+      var ids = [];
+      var doomed = root.querySelectorAll('.rl-card[data-doomed="1"]');
+      for (var i = 0; i < doomed.length; i++) {
+        ids.push(doomed[i].getAttribute('data-ride-id'));
+      }
+      return ids;
+    },
+    set: function () {}
+  },
+  initialize: function () {
+    var root = this.$element[0];
+    var container = root.querySelector('#rideLogsContainer');
+    var countSpan = root.querySelector('#rideLogsCount');
+    var logs = (this.config && this.config.logs) || [];
+
+    try {
+      var localCached = JSON.parse(window.localStorage.getItem('coasterwatch_ride_logs_local') || '[]');
+      if (localCached && localCached.length > 0) {
+        var existingIds = {};
+        logs.forEach(function (r) { existingIds[r.id] = true; });
+        localCached.forEach(function (r) {
+          if (!existingIds[r.id]) {
+            logs.push(r);
+          }
+        });
+      }
+    } catch (e) {}
+
+    function copyToClipboard(text, btnElement) {
+      var origText = btnElement.textContent;
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(function () {
+          btnElement.textContent = 'Copied! ✓';
+          setTimeout(function () { btnElement.textContent = origText; }, 2000);
+        }).catch(function () {
+          fallbackCopy(text, btnElement, origText);
+        });
+      } else {
+        fallbackCopy(text, btnElement, origText);
+      }
+    }
+
+    function fallbackCopy(text, btnElement, origText) {
+      var ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.top = '0';
+      ta.style.left = '0';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.focus();
+      ta.select();
+      try {
+        document.execCommand('copy');
+        btnElement.textContent = 'Copied! ✓';
+      } catch (err) {
+        btnElement.textContent = 'Failed to copy';
+      }
+      setTimeout(function () { btnElement.textContent = origText; }, 2000);
+      document.body.removeChild(ta);
+    }
+
+    function buildCsv(ride) {
+      var csvRows = ['timestamp_ms,accel_x,accel_y,accel_z,total_g,heading_deg,latitude,longitude'];
+      var lat = (ride.gps && ride.gps.lat) ? ride.gps.lat : '';
+      var lon = (ride.gps && ride.gps.lon) ? ride.gps.lon : '';
+      if (ride.samples) {
+        ride.samples.forEach(function (s) {
+          csvRows.push([s[0], s[1], s[2], s[3], s[4], s[5], lat, lon].join(','));
+        });
+      }
+      return csvRows.join('\n');
+    }
+
+    var pendingEl = root.querySelector('#rlPending');
+    var clearAllBtn = root.querySelector('#rlClearAll');
+
+    // Reflects how many rides are marked for removal. Deliberately explicit
+    // that GitHub is untouched: someone deleting from the phone should not
+    // have to wonder whether their uploaded telemetry just went too.
+    function refreshPending() {
+      var n = container.querySelectorAll('.rl-card[data-doomed="1"]').length;
+      if (!pendingEl) return;
+      if (n === 0) {
+        pendingEl.style.display = 'none';
+        pendingEl.textContent = '';
+      } else {
+        pendingEl.style.display = '';
+        pendingEl.textContent = n + ' ride' + (n === 1 ? '' : 's') +
+          ' will be deleted from this phone when you tap Save. ' +
+          'Anything already synced to GitHub stays there.';
+      }
+      if (clearAllBtn) {
+        var total = container.querySelectorAll('.rl-card').length;
+        clearAllBtn.style.display = total ? '' : 'none';
+      }
+    }
+
+    function setDoomed(card, doomed) {
+      card.setAttribute('data-doomed', doomed ? '1' : '0');
+      if (doomed) card.classList.add('rl-doomed');
+      else card.classList.remove('rl-doomed');
+      var btn = card.querySelector('.rl-btn-del');
+      if (btn) btn.textContent = doomed ? 'Undo' : 'Delete';
+      refreshPending();
+    }
+
+    if (clearAllBtn) {
+      clearAllBtn.onclick = function (ev) {
+        ev.preventDefault();
+        var cards = container.querySelectorAll('.rl-card');
+        // If everything is already marked, the button undoes instead — no
+        // way to get stuck having nuked the lot by a stray tap.
+        var allDoomed = cards.length > 0;
+        for (var i = 0; i < cards.length; i++) {
+          if (cards[i].getAttribute('data-doomed') !== '1') { allDoomed = false; break; }
+        }
+        for (var j = 0; j < cards.length; j++) setDoomed(cards[j], !allDoomed);
+      };
+    }
+
+    function renderCards(rideList) {
+      container.innerHTML = '';
+      countSpan.textContent = String(rideList.length);
+
+      if (rideList.length === 0) {
+        container.innerHTML = '<div class="rl-empty">' +
+          'No rides recorded yet.<br>' +
+          'To log a ride: open any ride\'s graph view on your watch, swipe left (or long-press SELECT) to the <b>Ride G-Tracker</b>, and press SELECT to start recording!<br><br>' +
+          '<button type="button" id="rlBtnDemo" class="rl-btn" style="margin-top:6px;background:#333;border:1px solid #666;">➕ Add Sample Test Ride (Demo)</button>' +
+        '</div>';
+
+        var demoBtn = container.querySelector('#rlBtnDemo');
+        if (demoBtn) {
+          demoBtn.onclick = function (ev) {
+            ev.preventDefault();
+            var dummySamples = [];
+            for (var k = 0; k < 50; k++) {
+              var t = k * 40;
+              var ax = Math.round(Math.sin(k / 5.0) * 1500);
+              var ay = Math.round(Math.cos(k / 7.0) * 800);
+              var az = 1000 + Math.round(Math.sin(k / 3.0) * 2500);
+              var g = Math.round((Math.sqrt(ax * ax + ay * ay + az * az) / 1000.0) * 100) / 100;
+              var head = Math.round(((k * 7.2) % 360.0) * 10) / 10.0;
+              dummySamples.push([t, ax, ay, az, g, head]);
+            }
+            var demoRide = {
+              id: 'ride_demo_' + Date.now(),
+              rideId: 101,
+              rideName: 'Hyperion (Test Demo)',
+              park: 'Energylandia',
+              recordedAt: new Date().toISOString(),
+              durationSec: 85,
+              sampleRateHz: 25,
+              sampleIntervalMs: 40,
+              summary: {
+                maxG: 4.85,
+                // A magnitude, so never negative — the demo has to be
+                // representative of what the watch can actually report.
+                minG: 0.12,
+                avgG: 1.34,
+                airtimeSec: 4.2,
+                airtimeHills: 5,
+                maxAirtimeSec: 1.4,
+                highGSec: 6.8,
+                turns: 7,
+                rotationDeg: 1260,
+                roughness: 480,
+                totalSamples: dummySamples.length
+              },
+              gps: { lat: 49.9972, lon: 19.4081 },
+              samples: dummySamples
+            };
+            logs.unshift(demoRide);
+            try {
+              window.localStorage.setItem('coasterwatch_ride_logs_local', JSON.stringify(logs));
+            } catch (e) {}
+            renderCards(logs);
+          };
+        }
+        refreshPending();
+        return;
+      }
+
+      rideList.forEach(function (ride) {
+        var sm = ride.summary || {};
+        var card = document.createElement('div');
+        card.className = 'rl-card';
+        card.setAttribute('data-ride-id', ride.id || '');
+        card.setAttribute('data-doomed', '0');
+
+        // --- title row: name, and whether it made it to the cloud ---
+        var head = document.createElement('div');
+        head.className = 'rl-head';
+        var name = document.createElement('span');
+        name.className = 'rl-name';
+        name.textContent = ride.rideName || 'Coaster';
+        head.appendChild(name);
+
+        var chip = document.createElement('span');
+        if (ride.githubSynced) {
+          chip.className = 'rl-chip rl-chip-ok';
+          chip.textContent = 'Synced';
+        } else {
+          chip.className = 'rl-chip';
+          chip.textContent = 'On phone';
+        }
+        head.appendChild(chip);
+        card.appendChild(head);
+
+        // --- one meta line with date, duration, sample count, and park ---
+        var d = new Date(ride.recordedAt);
+        var when = isNaN(d.getTime()) ? '' : d.toLocaleDateString([], { day: 'numeric', month: 'short' }) +
+                   ' ' + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        var countStr = (ride.samples ? ride.samples.length : (sm.totalSamples || 0)) +
+                       ' samples @ ' + (ride.sampleRateHz || 25) + 'Hz';
+        var meta = document.createElement('div');
+        meta.className = 'rl-meta';
+        meta.innerHTML = [when, (ride.durationSec || 0) + 's', '<span class="rl-count">' + countStr + '</span>', ride.park || '']
+                             .filter(function (x) { return x; }).join(' · ');
+        card.appendChild(meta);
+
+        // --- the numbers, as a scannable grid rather than a run-on sentence ---
+        function g(v) { return (typeof v === 'number' ? v.toFixed(2) : '--') + 'G'; }
+        var cells = [
+          ['Peak', g(sm.maxG)],
+          ['Min', g(sm.minG)],
+          ['Avg', g(sm.avgG)],
+          ['Airtime', (sm.airtimeSec || 0) + 's', (sm.airtimeHills || 0) + ' hills'],
+          ['Turns', String(sm.turns || 0), (sm.rotationDeg || 0) + '°'],
+          ['Rough', String(sm.roughness || 0), (sm.highGSec || 0) + 's >2G']
+        ];
+        var grid = document.createElement('div');
+        grid.className = 'rl-grid';
+        cells.forEach(function (c) {
+          var cell = document.createElement('div');
+          cell.className = 'rl-cell';
+          var val = document.createElement('div');
+          val.className = 'rl-val';
+          val.textContent = c[1];
+          var lab = document.createElement('div');
+          lab.className = 'rl-lab';
+          lab.textContent = c[2] ? c[0] + ' · ' + c[2] : c[0];
+          cell.appendChild(val);
+          cell.appendChild(lab);
+          grid.appendChild(cell);
+        });
+        card.appendChild(grid);
+
+        // --- caveats, only when they apply ---
+        var notes = [];
+        if (ride.clippedSamples) {
+          notes.push(ride.clippedSamples + ' sample' + (ride.clippedSamples === 1 ? '' : 's') +
+                     ' hit the ±4g sensor limit — peak is a floor, not a measurement.');
+        }
+        if (ride.truncated) {
+          notes.push('Sample buffer filled before the ride ended — the stats cover the whole ' +
+                     'ride, the exported samples stop early.');
+        }
+        if (notes.length) {
+          var warn = document.createElement('div');
+          warn.className = 'rl-warn';
+          warn.textContent = '⚠ ' + notes.join(' ');
+          card.appendChild(warn);
+        }
+
+        // --- actions: Copy CSV, Copy JSON, and Delete on a single clean row ---
+        var btnRow = document.createElement('div');
+        btnRow.className = 'rl-btns';
+        [['CSV', function () { return buildCsv(ride); }],
+         ['JSON', function () { return JSON.stringify(ride, null, 2); }]
+        ].forEach(function (spec) {
+          var b = document.createElement('button');
+          b.type = 'button';
+          b.className = 'rl-btn';
+          b.textContent = 'Copy ' + spec[0];
+          b.onclick = function (ev) { ev.preventDefault(); copyToClipboard(spec[1](), b); };
+          btnRow.appendChild(b);
+        });
+
+        var del = document.createElement('button');
+        del.type = 'button';
+        del.className = 'rl-btn rl-btn-del';
+        del.textContent = 'Delete';
+        del.onclick = function (ev) {
+          ev.preventDefault();
+          setDoomed(card, card.getAttribute('data-doomed') !== '1');
+        };
+        btnRow.appendChild(del);
+
+        card.appendChild(btnRow);
+
+        container.appendChild(card);
+      });
+      refreshPending();
+    }
+
+    renderCards(logs);
+  }
+};
+
 // Gets serialized (via tosource) and re-run entirely inside the settings
 // webview — a separate JS context from PKJS that never shares a closure
 // with it, so everything this needs must either be a nested function
@@ -1062,16 +2093,14 @@ function claySettingsCustomFn() {
   function injectGlobalClayStyle() {
     var style = document.createElement('style');
     style.textContent =
-      // Defensive reset: a Clay-rendered element that ends up wider than
-      // the viewport (padding/borders added on top of a percentage width,
-      // rather than counted inside it) widens the whole settings frame.
-      // border-box plus a hard overflow clamp keeps any one such element
-      // from doing that to the entire page.
       '*{box-sizing:border-box;}' +
       'html,body{max-width:100%;overflow-x:hidden;}' +
       'body{background:#1c1c1c;color:#eee;}' +
       '.section{border-bottom:1px solid #333;padding-bottom:4px;}' +
       '.rl-park.hide{display:none;}' +
+      '.rl-btns{display:flex !important;flex-direction:row !important;flex-wrap:nowrap !important;align-items:stretch !important;gap:6px !important;width:100% !important;box-sizing:border-box !important;}' +
+      '.rl-btns .rl-btn{flex:1 !important;min-width:0 !important;width:auto !important;max-width:none !important;white-space:nowrap !important;overflow:hidden !important;text-overflow:ellipsis !important;text-align:center !important;padding:7px 2px !important;}' +
+      '.rl-btns .rl-btn-del{flex:1 !important;min-width:0 !important;margin-left:0 !important;text-align:center !important;}' +
       '.attribution{text-align:center;margin:20px 0 10px;padding:10px 0;font-size:13px;color:#aaa;}' +
       '.attribution a{color:#7ab8ff;}';
     document.head.appendChild(style);
@@ -1085,6 +2114,67 @@ function claySettingsCustomFn() {
 
   clayConfig.on(clayConfig.EVENTS.AFTER_BUILD, function () {
     injectGlobalClayStyle();
+
+    // Hook up interactive GitHub Test Connection button
+    var tokenInput = document.querySelector('input[name="ghToken"]');
+    var repoInput = document.querySelector('input[name="ghRepo"]');
+    var ghSection = tokenInput ? tokenInput.closest('.section') : null;
+    if (ghSection && !document.getElementById('ghTestBtn')) {
+      var btnDiv = document.createElement('div');
+      btnDiv.style.marginTop = '10px';
+      btnDiv.style.marginBottom = '6px';
+      btnDiv.innerHTML = '<button type="button" id="ghTestBtn" class="rl-btn" style="background:#24292e;border:1px solid #666;padding:8px 12px;font-size:12px;cursor:pointer;">🧪 Test GitHub Connection</button><span id="ghTestStatus" style="font-size:12px;margin-left:8px;vertical-align:middle;"></span>';
+      ghSection.appendChild(btnDiv);
+
+      var testBtn = document.getElementById('ghTestBtn');
+      var testStatus = document.getElementById('ghTestStatus');
+      testBtn.onclick = function (e) {
+        e.preventDefault();
+        var tok = (tokenInput.value || '').trim();
+        var rep = (repoInput.value || '').trim();
+        if (!tok || !rep) {
+          testStatus.style.color = '#ffaa00';
+          testStatus.textContent = 'Please enter both Token and Repository.';
+          return;
+        }
+        testStatus.style.color = '#7ab8ff';
+        testStatus.textContent = 'Testing connection...';
+
+        var authHeader = (tok.indexOf('Bearer ') === 0 || tok.indexOf('token ') === 0) ? tok : 'Bearer ' + tok;
+        var xhr = new XMLHttpRequest();
+        xhr.open('GET', 'https://api.github.com/repos/' + rep, true);
+        xhr.setRequestHeader('Authorization', authHeader);
+        xhr.setRequestHeader('Accept', 'application/vnd.github.v3+json');
+        xhr.timeout = 15000;
+        xhr.onload = function () {
+          if (xhr.status === 200) {
+            testStatus.style.color = '#4caf50';
+            testStatus.textContent = '✓ Connected! (Repository verified)';
+          } else if (xhr.status === 401) {
+            testStatus.style.color = '#e53935';
+            testStatus.textContent = '✕ HTTP 401: Invalid Token (Bad credentials)';
+          } else if (xhr.status === 404) {
+            testStatus.style.color = '#e53935';
+            testStatus.textContent = '✕ HTTP 404: Repo not found or Token lacks "repo"/"Contents" permission';
+          } else if (xhr.status === 403) {
+            testStatus.style.color = '#e53935';
+            testStatus.textContent = '✕ HTTP 403: Permission denied (Contents: Read & Write required)';
+          } else {
+            testStatus.style.color = '#e53935';
+            testStatus.textContent = '✕ Error HTTP ' + xhr.status;
+          }
+        };
+        xhr.onerror = function () {
+          testStatus.style.color = '#e53935';
+          testStatus.textContent = '✕ Network error connecting to api.github.com';
+        };
+        xhr.ontimeout = function () {
+          testStatus.style.color = '#e53935';
+          testStatus.textContent = '✕ Request timed out';
+        };
+        xhr.send();
+      };
+    }
   });
 }
 
@@ -1109,9 +2199,6 @@ function buildClayConfig() {
       var rides = [];
       for (var j = 0; j < roster[i].rides.length; j++) {
         var r = roster[i].rides[j];
-        // energylandia.pl sets X-Frame-Options: SAMEORIGIN (verified via
-        // header check) — it refuses to load in the info overlay's iframe,
-        // so those links are worse than no link at all; omit them entirely.
         var infoUrl = (r.infoUrl && r.infoUrl.indexOf('energylandia.pl') === -1) ? r.infoUrl : '';
         rides.push({ id: r.id, name: r.name, infoUrl: infoUrl, checked: visible.has(r.id) });
       }
@@ -1120,12 +2207,52 @@ function buildClayConfig() {
     parksData.push({ parkId: pid, lands: lands, defaultVisible: PARKS[pid].defaultVisible });
   }
 
+  var rawLogs = localStorage.getItem('coasterwatch_ride_logs');
+  var logs = [];
+  if (rawLogs) {
+    try {
+      var parsed = JSON.parse(rawLogs);
+      if (Array.isArray(parsed)) {
+        logs = parsed.map(function (r) {
+          var samples = r.samples || [];
+          var compactSamples = samples;
+          if (samples.length > 100) {
+            compactSamples = [];
+            var step = (samples.length - 1) / 99.0;
+            for (var idx = 0; idx < 100; idx++) {
+              compactSamples.push(samples[Math.floor(idx * step)]);
+            }
+          }
+          return {
+            id: r.id,
+            rideId: r.rideId,
+            rideName: r.rideName,
+            park: r.park,
+            recordedAt: r.recordedAt,
+            durationSec: r.durationSec,
+            sampleRateHz: r.sampleRateHz,
+            truncated: r.truncated,
+            clippedSamples: r.clippedSamples,
+            githubSynced: r.githubSynced,
+            summary: r.summary,
+            gps: r.gps,
+            samples: compactSamples
+          };
+        });
+      }
+    } catch (e) {}
+  }
+
   return [
     { type: 'heading', defaultValue: 'CoasterWatch Settings', size: 3 },
     { type: 'section', items: [
       { type: 'heading', defaultValue: 'Park', size: 4 },
       { type: 'select', id: 'park', messageKey: 'park', label: 'Park',
         defaultValue: String(parkId), options: parkOptions }
+    ] },
+    { type: 'section', items: [
+      { type: 'heading', defaultValue: 'Rides', size: 4 },
+      { type: 'ridelist', id: 'rides', messageKey: 'visibleRideIds', activeParkId: parkId, parks: parksData }
     ] },
     { type: 'section', items: [
       { type: 'heading', defaultValue: 'Tile Colours', size: 4 },
@@ -1148,9 +2275,17 @@ function buildClayConfig() {
         defaultValue: String(bands.vibePattern),
         options: VIBE_PATTERN_NAMES.map(function (name, i) { return { label: name, value: String(i) }; }) }
     ] },
+    // Recordings and their cloud sync are one section: sync exists only to
+    // serve recordings, and separating them left the whole 69-row ride picker
+    // between the two. Last on the page — it's data you read, not settings you
+    // change, and the settings above are all set-once.
     { type: 'section', items: [
-      { type: 'heading', defaultValue: 'Rides', size: 4 },
-      { type: 'ridelist', id: 'rides', messageKey: 'visibleRideIds', activeParkId: parkId, parks: parksData }
+      { type: 'heading', defaultValue: 'Ride Recordings', size: 4 },
+      { type: 'ridelogs', id: 'rideLogs', messageKey: 'deletedRideLogs', logs: logs },
+      { type: 'githubsync', id: 'githubSync', messageKey: 'githubSync',
+        enabled: isGitHubSyncEnabled(),
+        token: localStorage.getItem(GITHUB_TOKEN_KEY) || DEFAULT_GITHUB_TOKEN,
+        repo: localStorage.getItem(GITHUB_REPO_KEY) || DEFAULT_GITHUB_REPO }
     ] },
     { type: 'submit', defaultValue: 'Save' }
   ];
@@ -1159,16 +2294,42 @@ function buildClayConfig() {
 Pebble.addEventListener('showConfiguration', function () {
   var clay = new Clay(buildClayConfig(), claySettingsCustomFn, { autoHandleEvents: false });
   clay.registerComponent(RIDE_LIST_COMPONENT);
+  clay.registerComponent(GITHUB_SYNC_COMPONENT);
+  clay.registerComponent(RIDE_LOGS_COMPONENT);
   Pebble.openURL(clay.generateUrl());
 });
 
 Pebble.addEventListener('webviewclosed', function (e) {
   if (!e.response) return;
   try {
-    // getSettings() only needs localStorage, not a fully-configured
-    // instance — an empty config is fine for parsing the response.
     var raw = new Clay([], null, { autoHandleEvents: false }).getSettings(e.response, false);
     var refresh = false;
+
+    var doomed = (raw.deletedRideLogs && raw.deletedRideLogs.value) || raw.deletedRideLogs;
+    if (doomed && doomed.length) {
+      var gone = deleteRideLogs(doomed);
+      console.log('CoasterWatch: Deleted ' + gone + ' ride log(s) from the phone; ' +
+                  'GitHub copies untouched.');
+    }
+
+    var ghSync = (raw.githubSync && raw.githubSync.value) || raw.githubSync;
+    if (ghSync) {
+      var tok = ghSync.token || (typeof ghSync === 'string' ? ghSync : '');
+      var rep = ghSync.repo || '';
+      if (tok && tok.length > 0) {
+        localStorage.setItem(GITHUB_TOKEN_KEY, String(tok).trim());
+        console.log('CoasterWatch: Persisted GitHub token to PKJS storage');
+      }
+      if (rep && rep.length > 0) {
+        localStorage.setItem(GITHUB_REPO_KEY, String(rep).trim());
+      }
+      // Explicit compare: `false` is a real value here, so the "only save
+      // truthy things" pattern used for the credentials above would make the
+      // toggle impossible to turn off.
+      if (ghSync.enabled !== undefined) {
+        localStorage.setItem(GITHUB_ENABLED_KEY, ghSync.enabled ? '1' : '0');
+      }
+    }
 
     if (raw.park && raw.park.value !== undefined) {
       var newParkId = parseInt(raw.park.value, 10);

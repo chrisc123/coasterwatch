@@ -68,6 +68,9 @@ function loadPkjs(options) {
     XMLHttpRequest: function XMLHttpRequestStub() {
       const self = this;
       this.open = (method, url) => { self._method = method; self._url = url; };
+      // Real pkjs XHRs have this; without it any code path that sets a header
+      // (the GitHub sync does) dies with "not a function" inside the harness.
+      this.setRequestHeader = (k, v) => { (self._headers = self._headers || {})[k] = v; };
       this.send = () => {
         if (!options.xhrHandler) return;
         const result = options.xhrHandler(self._url, self._method);
@@ -80,6 +83,15 @@ function loadPkjs(options) {
       };
     },
     navigator: { geolocation: null },
+    // The real pkjs environment has timers; the sandbox needs them too or
+    // getLocation() throws on its own watchdog before it ever calls back.
+    // Unref'd so a pending watchdog can't hold the test process open.
+    setTimeout: (fn, ms) => {
+      const t = setTimeout(fn, ms);
+      if (t && t.unref) t.unref();
+      return t;
+    },
+    clearTimeout: (t) => clearTimeout(t),
   };
   vm.createContext(sandbox);
 
@@ -128,6 +140,12 @@ function loadPkjs(options) {
 function buildSettingsHtml(pkjsCtx) {
   const clay = new pkjsCtx.Clay(pkjsCtx.buildClayConfig(), pkjsCtx.claySettingsCustomFn, { autoHandleEvents: false });
   clay.registerComponent(pkjsCtx.RIDE_LIST_COMPONENT);
+  if (pkjsCtx.GITHUB_SYNC_COMPONENT) {
+    clay.registerComponent(pkjsCtx.GITHUB_SYNC_COMPONENT);
+  }
+  if (pkjsCtx.RIDE_LOGS_COMPONENT) {
+    clay.registerComponent(pkjsCtx.RIDE_LOGS_COMPONENT);
+  }
   const url = clay.generateUrl();
   return decodeURIComponent(url.replace(/^data:text\/html;charset=utf-8,/, ''));
 }

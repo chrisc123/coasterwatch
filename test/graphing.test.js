@@ -242,27 +242,35 @@ test('isParkOpenNow: false for a non-OPERATING day, true (fail-open) when schedu
     true, 'unparseable times must fail open too');
 });
 
+// Decodes the RidesData wire format the watch parses in inbox_received_callback:
+//   [count]{ id(4) wait(2) dist(4) flags(1) nameLen(1) name(nameLen) }*
+// Kept as one helper so a format change breaks in a single place rather than
+// being half-updated across tests.
+function decodeRidesData(bytes) {
+  const s16 = (v) => (v << 16) >> 16;
+  const rides = [];
+  let o = 1;
+  for (let i = 0; i < bytes[0]; i++) {
+    const id = (bytes[o] << 24) | (bytes[o + 1] << 16) | (bytes[o + 2] << 8) | bytes[o + 3];
+    o += 4;
+    const wait = s16((bytes[o] << 8) | bytes[o + 1]);
+    o += 2;
+    const dist = (bytes[o] << 24) | (bytes[o + 1] << 16) | (bytes[o + 2] << 8) | bytes[o + 3];
+    o += 4;
+    const flags = bytes[o++];
+    const nameLen = bytes[o++];
+    let name = '';
+    for (let k = 0; k < nameLen; k++) name += String.fromCharCode(bytes[o + k]);
+    o += nameLen;
+    rides.push({ id, wait, dist, flags, name });
+  }
+  return { rides, bytesConsumed: o };
+}
+
 function unpackRidesData(sentMessages) {
   const msg = sentMessages.find((m) => 'RidesData' in m);
   if (!msg) return [];
-  const bytes = msg.RidesData;
-  const count = bytes[0];
-  const out = [];
-  let offset = 1;
-  for (let i = 0; i < count && offset < bytes.length; i++) {
-    const id = (bytes[offset] << 24) | (bytes[offset + 1] << 16) | (bytes[offset + 2] << 8) | bytes[offset + 3];
-    offset += 4;
-    const wait = ((bytes[offset] << 8) | bytes[offset + 1]) << 16 >> 16;
-    offset += 2;
-    const dist = (bytes[offset] << 24) | (bytes[offset + 1] << 16) | (bytes[offset + 2] << 8) | bytes[offset + 3];
-    offset += 4;
-    const nameLen = bytes[offset++];
-    let name = '';
-    for (let k = 0; k < nameLen; k++) name += String.fromCharCode(bytes[offset + k]);
-    offset += nameLen;
-    out.push({ id, wait, dist, name });
-  }
-  return out;
+  return decodeRidesData(msg.RidesData).rides;
 }
 
 test('fetchQueueTimes overrides every ride to closed when the park schedule says it is not open, ' +
@@ -365,40 +373,60 @@ test('sendRidesToWatch packages all rides into an atomic RidesData byte array', 
 
   const bytes = msg.RidesData;
   assert.strictEqual(bytes[0], 2, 'count must be 2');
+  const { rides: got, bytesConsumed } = decodeRidesData(bytes);
 
-  // Unpack ride 1 (Abyssus)
-  let offset = 1;
-  const id1 = (bytes[offset] << 24) | (bytes[offset + 1] << 16) | (bytes[offset + 2] << 8) | bytes[offset + 3];
-  offset += 4;
-  const wait1 = (bytes[offset] << 8) | bytes[offset + 1];
-  offset += 2;
-  const dist1 = (bytes[offset] << 24) | (bytes[offset + 1] << 16) | (bytes[offset + 2] << 8) | bytes[offset + 3];
-  offset += 4;
-  const nameLen1 = bytes[offset++];
-  let name1 = '';
-  for (let k = 0; k < nameLen1; k++) name1 += String.fromCharCode(bytes[offset + k]);
-  offset += nameLen1;
+  assert.deepStrictEqual(got[0], { id: 11281, wait: 15, dist: 120, flags: 0, name: 'Abyssus' });
+  assert.deepStrictEqual(got[1], { id: 11270, wait: -1, dist: 350, flags: 0, name: 'Hyperion' },
+    'closed ride must encode wait as -1');
+  assert.strictEqual(bytesConsumed, bytes.length,
+    'no trailing bytes — the watch walks this packet by the same offsets');
+});
 
-  assert.strictEqual(id1, 11281);
-  assert.strictEqual(wait1, 15);
-  assert.strictEqual(dist1, 120);
-  assert.strictEqual(name1, 'Abyssus');
+test('a ride recorded today is flagged so the grid can tick it', () => {
+  const pkjs = loadPkjs();
+  const rides = [
+    { id: 11281, name: 'Abyssus', is_open: true, wait_time: 15, _distance: 120 },
+    { id: 11270, name: 'Hyperion', is_open: true, wait_time: 5, _distance: 350 },
+  ];
 
-  // Unpack ride 2 (Hyperion, closed => wait -1)
-  const id2 = (bytes[offset] << 24) | (bytes[offset + 1] << 16) | (bytes[offset + 2] << 8) | bytes[offset + 3];
-  offset += 4;
-  const wait2 = ((bytes[offset] << 8) | bytes[offset + 1]) << 16 >> 16; // sign extend 16-bit
-  offset += 2;
-  const dist2 = (bytes[offset] << 24) | (bytes[offset + 1] << 16) | (bytes[offset + 2] << 8) | bytes[offset + 3];
-  offset += 4;
-  const nameLen2 = bytes[offset++];
-  let name2 = '';
-  for (let k = 0; k < nameLen2; k++) name2 += String.fromCharCode(bytes[offset + k]);
+  pkjs.sendRidesToWatch(rides, true);
+  let got = decodeRidesData(pkjs.__sentMessages.pop().RidesData).rides;
+  assert.deepStrictEqual(got.map((r) => r.flags), [0, 0], 'nothing recorded yet');
 
-  assert.strictEqual(id2, 11270);
-  assert.strictEqual(wait2, -1, 'closed ride must encode wait as -1');
-  assert.strictEqual(dist2, 350);
-  assert.strictEqual(name2, 'Hyperion');
+  // A recording today for Abyssus only.
+  pkjs.localStorage.setItem('coasterwatch_ride_logs', JSON.stringify([
+    { id: 'r1', rideId: 11281, recordedAt: new Date().toISOString() },
+  ]));
+  pkjs.sendRidesToWatch(rides, true);
+  got = decodeRidesData(pkjs.__sentMessages.pop().RidesData).rides;
+  assert.deepStrictEqual(got.map((r) => r.flags), [1, 0], 'only the ride actually logged gets the flag');
+});
+
+test('yesterday\'s recording does not tick today\'s grid', () => {
+  const pkjs = loadPkjs();
+  const rides = [{ id: 11281, name: 'Abyssus', is_open: true, wait_time: 15, _distance: 120 }];
+
+  const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+  pkjs.localStorage.setItem('coasterwatch_ride_logs', JSON.stringify([
+    { id: 'r1', rideId: 11281, recordedAt: yesterday },
+  ]));
+
+  pkjs.sendRidesToWatch(rides, true);
+  const got = decodeRidesData(pkjs.__sentMessages.pop().RidesData).rides;
+  assert.strictEqual(got[0].flags, 0,
+    'the tick means "logged today", so it must clear over midnight rather than ' +
+    'marking a ride forever after one recording');
+});
+
+test('a corrupt ride-log store degrades to no ticks rather than breaking the grid', () => {
+  const pkjs = loadPkjs();
+  pkjs.localStorage.setItem('coasterwatch_ride_logs', '{not json');
+  const rides = [{ id: 11281, name: 'Abyssus', is_open: true, wait_time: 15, _distance: 120 }];
+
+  pkjs.sendRidesToWatch(rides, true);
+  const got = decodeRidesData(pkjs.__sentMessages.pop().RidesData).rides;
+  assert.strictEqual(got[0].flags, 0);
+  assert.strictEqual(got[0].name, 'Abyssus', 'the queue grid itself must still arrive');
 });
 
 test('sendRidesToWatch skips transmission when data is unchanged unless forceSend is set', () => {

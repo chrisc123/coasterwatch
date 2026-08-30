@@ -69,8 +69,36 @@
 #define SETTINGS_ALERTS_KEY  2
 #define SETTINGS_BANDS_KEY   3
 #define SETTINGS_CACHED_RIDES_COUNT_KEY 4
-#define SETTINGS_CACHED_RIDES_DATA_KEY  5
+#define SETTINGS_CACHED_RIDES_DATA_KEY  5  // legacy blob; only deleted now
 #define SETTINGS_TOUCH_LOCK_KEY 6
+// Chunked ride cache. persist_write_data() caps a *single value* at
+// PERSIST_DATA_MAX_LENGTH (256) and — the trap — silently returns a short
+// write rather than failing, so the old single-key blob asked to store 1600
+// bytes, got 256 back, and had only ever cached the first ~6 of 40 rides.
+#define SETTINGS_RIDE_CACHE_BASE_KEY   10
+// Sized to the realistic need, not the theoretical maximum: a 40-ride park at
+// ~8 bytes plus a name each lands near 800 bytes. Whatever doesn't fit simply
+// isn't cached (the pack loop stops), which costs a couple of tiles on the
+// launch screen and nothing else. Aplite has 24KB of app RAM in total and the
+// link fails outright at 8 chunks, so it gets a smaller cache rather than the
+// feature being dropped.
+#define SETTINGS_RIDE_CACHE_MAX_CHUNKS 4
+
+// Aplite (the 2013 Pebble: 24KB of app RAM, and this app already fills it)
+// cannot fit the pack/unpack code — the link overflows the APP region by
+// ~190 bytes with it in, and shrinking the buffer doesn't help because it's
+// the code, not the data. It gets no launch cache: an empty grid for the
+// second or two before the phone answers, which is what it did before the
+// cache existed at all. Everything else on aplite is unaffected.
+#if defined(PBL_PLATFORM_APLITE)
+#define RIDE_CACHE_SUPPORTED 0
+#else
+#define RIDE_CACHE_SUPPORTED 1
+#endif
+// Bump when the record layout below changes, so a stale cache is discarded
+// instead of being read back misaligned. (Adding RideTile.flags moved
+// sizeof(RideTile) 36 -> 40 and would have done exactly that.)
+#define RIDE_CACHE_VERSION 1
 // queue-times.com updates its data every 5 minutes, so polling more often
 // than that just burns battery/network for no fresher data.
 #define REFRESH_INTERVAL_MS (5 * 60 * 1000)
@@ -81,13 +109,32 @@
 #define ALERT_DEFAULT_MINUTES 15
 #define ALERT_BAND_HEIGHT     44
 
-typedef enum { SORT_TIME = 0, SORT_DISTANCE = 1, SORT_ALERTS = 2 } SortMode;
+// These values are PERSISTED (SETTINGS_SORT_KEY), so they are append-only —
+// the numbers must keep the meaning they shipped with. SORT_TIME_DESC is 3,
+// not 1, precisely because inserting it at 1 renumbered DISTANCE and ALERTS
+// underneath every watch that already had one of them saved: on the next
+// launch a watch set to Distance came back on Time-descending and one set to
+// Alerts came back on Distance, which reads exactly like "the setting didn't
+// persist". The cycle *order* below is independent of these numbers, so
+// appending costs nothing.
+typedef enum {
+  SORT_TIME_ASC = 0,   // shipped as SORT_TIME
+  SORT_DISTANCE = 1,
+  SORT_ALERTS = 2,
+  SORT_TIME_DESC = 3,  // appended
+  SORT_MODE_COUNT
+} SortMode;
+
+// Per-ride flag bits from the phone's RidesData packet. The phone owns the
+// "is it today" decision because it owns anything timezone-aware.
+#define RIDE_FLAG_LOGGED_TODAY (1 << 0)
 
 typedef struct {
   int32_t ride_id;
   char    name[NAME_BUF_LEN];
   int16_t wait_minutes;   // -1 = closed
   int32_t distance_m;     // -1 = unknown
+  uint8_t flags;          // RIDE_FLAG_*
 } RideTile;
 
 // A ride's queue alert: buzz when its wait drops to or below threshold_min.
@@ -185,7 +232,7 @@ static int32_t  s_cursor_ride_id = -1;
 static int      s_pending_total = 0;
 static bool     s_phone_connected = false;
 static bool     s_show_error      = false;
-static SortMode s_sort_mode       = SORT_TIME;
+static SortMode s_sort_mode       = SORT_TIME_ASC;
 
 static char s_header_buf[48];
 static char s_clock_buf[8];
@@ -243,10 +290,21 @@ static int tile_cols(void) { return TILE_COLS; }
 // compare_key can use it for SORT_ALERTS below.
 static AlertConfig *find_alert(int32_t ride_id);
 
-static int compare_wait(int a, int b) {
+static int compare_wait_asc(int a, int b) {
   int wa = s_rides[a].wait_minutes < 0 ? 9999 : s_rides[a].wait_minutes;
   int wb = s_rides[b].wait_minutes < 0 ? 9999 : s_rides[b].wait_minutes;
   if (wa != wb) return wa < wb ? -1 : 1;
+  return 0;
+}
+
+static int compare_wait_desc(int a, int b) {
+  int wa = s_rides[a].wait_minutes;
+  int wb = s_rides[b].wait_minutes;
+  // Closed rides (< 0) always sink to the bottom
+  if (wa < 0 && wb >= 0) return 1;
+  if (wa >= 0 && wb < 0) return -1;
+  if (wa < 0 && wb < 0) return 0;
+  if (wa != wb) return wa > wb ? -1 : 1;
   return 0;
 }
 
@@ -270,10 +328,11 @@ static int compare_key(int a, int b) {
     bool aa = ride_alert_armed(a);
     bool ab = ride_alert_armed(b);
     if (aa != ab) return aa ? -1 : 1;
-    return aa ? compare_wait(a, b) : compare_distance(a, b);
+    return aa ? compare_wait_asc(a, b) : compare_distance(a, b);
   }
   if (s_sort_mode == SORT_DISTANCE) return compare_distance(a, b);
-  return compare_wait(a, b);
+  if (s_sort_mode == SORT_TIME_DESC) return compare_wait_desc(a, b);
+  return compare_wait_asc(a, b);
 }
 
 // Small N (<= MAX_RIDES): a plain insertion sort is simpler than qsort here
@@ -380,20 +439,116 @@ static void load_band_config(void) {
   }
 }
 
+// The cache exists only so the grid shows something real on launch instead of
+// an empty screen while the phone is asked for fresh data. So it stores a
+// compact variable-length record rather than the raw struct:
+//
+//   id(4) wait(2) flags(1) nameLen(1) name(nameLen)
+//
+// Distance is deliberately NOT cached. It's the one field guaranteed to be
+// wrong by the time it's read — it's a distance from wherever you were last
+// time — and the phone recomputes it from GPS on the very first refresh.
+// Caching it would put a confidently stale number on screen; omitting it
+// leaves format_distance() to render the -1 "unknown" case for a second or
+// two instead. Every other field is preserved in full.
+//
+// Roughly 4+2+1+1+len bytes a ride, so a typical 40-ride park lands near
+// 700-800 bytes, spread over 256-byte chunks.
 static void save_cached_rides(void) {
-  if (s_ride_count > 0) {
-    persist_write_int(SETTINGS_CACHED_RIDES_COUNT_KEY, s_ride_count);
-    persist_write_data(SETTINGS_CACHED_RIDES_DATA_KEY, s_rides, sizeof(s_rides));
+#if !RIDE_CACHE_SUPPORTED
+  return;
+#else
+  if (s_ride_count <= 0) return;
+
+  uint8_t buf[SETTINGS_RIDE_CACHE_MAX_CHUNKS * PERSIST_DATA_MAX_LENGTH];
+  uint32_t n = 0;
+  int cached = 0;
+  for (int i = 0; i < s_ride_count && i < MAX_RIDES; i++) {
+    uint8_t name_len = (uint8_t)strlen(s_rides[i].name);
+    if (n + 8 + name_len > sizeof(buf)) break;   // full: cache what fits
+    uint32_t id = (uint32_t)s_rides[i].ride_id;
+    buf[n++] = (uint8_t)(id >> 24); buf[n++] = (uint8_t)(id >> 16);
+    buf[n++] = (uint8_t)(id >> 8);  buf[n++] = (uint8_t)id;
+    uint16_t w = (uint16_t)s_rides[i].wait_minutes;
+    buf[n++] = (uint8_t)(w >> 8);   buf[n++] = (uint8_t)w;
+    buf[n++] = s_rides[i].flags;
+    buf[n++] = name_len;
+    memcpy(&buf[n], s_rides[i].name, name_len);
+    n += name_len;
+    cached++;
   }
+
+  // Header int packs version and byte count so a partial/older write can be
+  // spotted without trusting the chunks themselves.
+  persist_write_int(SETTINGS_CACHED_RIDES_COUNT_KEY,
+                    (int32_t)((RIDE_CACHE_VERSION << 24) | (cached << 16) | (int)n));
+
+  uint32_t written = 0;
+  for (int c = 0; c < SETTINGS_RIDE_CACHE_MAX_CHUNKS && written < n; c++) {
+    uint32_t take = n - written;
+    if (take > PERSIST_DATA_MAX_LENGTH) take = PERSIST_DATA_MAX_LENGTH;
+    // Short write means the cache is unreadable, so record less rather than
+    // leaving a header promising bytes that aren't there.
+    if (persist_write_data(SETTINGS_RIDE_CACHE_BASE_KEY + c, &buf[written], take) != (int)take) {
+      persist_write_int(SETTINGS_CACHED_RIDES_COUNT_KEY, 0);
+      return;
+    }
+    written += take;
+  }
+#endif
 }
 
 static void load_cached_rides(void) {
-  if (persist_exists(SETTINGS_CACHED_RIDES_COUNT_KEY) && persist_exists(SETTINGS_CACHED_RIDES_DATA_KEY)) {
-    s_ride_count = persist_read_int(SETTINGS_CACHED_RIDES_COUNT_KEY);
-    if (s_ride_count > MAX_RIDES) s_ride_count = MAX_RIDES;
-    persist_read_data(SETTINGS_CACHED_RIDES_DATA_KEY, s_rides, sizeof(s_rides));
-    recompute_order();
+#if !RIDE_CACHE_SUPPORTED
+  return;
+#else
+  if (!persist_exists(SETTINGS_CACHED_RIDES_COUNT_KEY)) return;
+
+  // Drop the pre-chunking blob if it's still around; it was never readable.
+  if (persist_exists(SETTINGS_CACHED_RIDES_DATA_KEY)) {
+    persist_delete(SETTINGS_CACHED_RIDES_DATA_KEY);
   }
+
+  int32_t header = persist_read_int(SETTINGS_CACHED_RIDES_COUNT_KEY);
+  int version = (header >> 24) & 0xFF;
+  int count = (header >> 16) & 0xFF;
+  uint32_t n = (uint32_t)(header & 0xFFFF);
+  if (version != RIDE_CACHE_VERSION || count <= 0 || count > MAX_RIDES) return;
+
+  uint8_t buf[SETTINGS_RIDE_CACHE_MAX_CHUNKS * PERSIST_DATA_MAX_LENGTH];
+  if (n > sizeof(buf)) return;
+
+  uint32_t got = 0;
+  for (int c = 0; c < SETTINGS_RIDE_CACHE_MAX_CHUNKS && got < n; c++) {
+    if (!persist_exists(SETTINGS_RIDE_CACHE_BASE_KEY + c)) return;
+    uint32_t want = n - got;
+    if (want > PERSIST_DATA_MAX_LENGTH) want = PERSIST_DATA_MAX_LENGTH;
+    if (persist_read_data(SETTINGS_RIDE_CACHE_BASE_KEY + c, &buf[got], want) != (int)want) return;
+    got += want;
+  }
+  if (got != n) return;
+
+  uint32_t o = 0;
+  int i = 0;
+  for (; i < count && o + 8 <= n; i++) {
+    s_rides[i].ride_id = (int32_t)(((uint32_t)buf[o] << 24) | ((uint32_t)buf[o + 1] << 16) |
+                                   ((uint32_t)buf[o + 2] << 8) | (uint32_t)buf[o + 3]);
+    o += 4;
+    s_rides[i].wait_minutes = (int16_t)(((uint16_t)buf[o] << 8) | (uint16_t)buf[o + 1]);
+    o += 2;
+    s_rides[i].flags = buf[o++];
+    uint8_t name_len = buf[o++];
+    if (o + name_len > n) break;
+    uint8_t copy = name_len < (NAME_BUF_LEN - 1) ? name_len : (NAME_BUF_LEN - 1);
+    memcpy(s_rides[i].name, &buf[o], copy);
+    s_rides[i].name[copy] = '\0';
+    o += name_len;
+    s_rides[i].distance_m = -1;  // not cached; the next refresh fills it in
+  }
+
+  s_ride_count = i;
+  if (s_ride_count > 0) recompute_order();
+#endif
 }
 
 // Pebble apps can't invoke the watch's own system alert-vibe picker (that's
@@ -582,9 +737,8 @@ static void update_header(void) {
   } else if (s_ride_count == 0) {
     status[0] = '\0';
   } else {
-    const char *sort_name = "Time";
-    if (s_sort_mode == SORT_DISTANCE) sort_name = "Distance";
-    else if (s_sort_mode == SORT_ALERTS) sort_name = "Alerts";
+    const char *sort_name = (s_sort_mode == SORT_TIME_ASC || s_sort_mode == SORT_TIME_DESC) ? "Time" :
+                            (s_sort_mode == SORT_DISTANCE) ? "Distance" : "Alerts";
 #if PBL_API_EXISTS(tap_recognizer_create)
     if (s_touch_locked) {
 #if defined(PBL_ROUND)
@@ -617,6 +771,28 @@ static void update_header(void) {
   if (s_header_layer) layer_mark_dirty(s_header_layer);
 }
 
+static void draw_sort_arrow(GContext *ctx, int center_x, int center_y, bool up, GColor color) {
+  graphics_context_set_stroke_color(ctx, color);
+  graphics_context_set_fill_color(ctx, color);
+  if (up) {
+    // 5px wide, 3px high upward triangle
+    graphics_draw_line(ctx, GPoint(center_x, center_y - 1),
+                            GPoint(center_x, center_y - 1));
+    graphics_draw_line(ctx, GPoint(center_x - 1, center_y),
+                            GPoint(center_x + 1, center_y));
+    graphics_draw_line(ctx, GPoint(center_x - 2, center_y + 1),
+                            GPoint(center_x + 2, center_y + 1));
+  } else {
+    // 5px wide, 3px high downward triangle
+    graphics_draw_line(ctx, GPoint(center_x - 2, center_y),
+                            GPoint(center_x + 2, center_y));
+    graphics_draw_line(ctx, GPoint(center_x - 1, center_y + 1),
+                            GPoint(center_x + 1, center_y + 1));
+    graphics_draw_line(ctx, GPoint(center_x, center_y + 2),
+                            GPoint(center_x, center_y + 2));
+  }
+}
+
 static void header_update_proc(Layer *layer, GContext *ctx) {
   GRect bounds = layer_get_bounds(layer);
   GFont font = fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD);
@@ -638,6 +814,11 @@ static void header_update_proc(Layer *layer, GContext *ctx) {
   graphics_fill_rect(ctx, bounds, 0, GCornerNone);
   graphics_context_set_text_color(ctx, GColorWhite);
 
+  int right_inset = TILE_PAD;
+  if (s_sort_mode == SORT_TIME_ASC || s_sort_mode == SORT_TIME_DESC) {
+    right_inset += 9;
+  }
+
 #if PBL_API_EXISTS(tap_recognizer_create)
   if (s_touch_locked) {
     // 1. Draw centered [LOCK] across the full screen width
@@ -652,24 +833,40 @@ static void header_update_proc(Layer *layer, GContext *ctx) {
 
     // 2. Draw right-aligned sort mode
     align = GTextAlignmentRight;
-    text_bounds = GRect(bounds.origin.x, bounds.origin.y, bounds.size.w - TILE_PAD, bounds.size.h);
+    text_bounds = GRect(bounds.origin.x, bounds.origin.y, bounds.size.w - right_inset, bounds.size.h);
     GSize content = graphics_text_layout_get_content_size(s_header_buf, font, text_bounds,
                                                            GTextOverflowModeFill, align);
     int y = (bounds.size.h - content.h) / 2;
     graphics_draw_text(ctx, s_header_buf, font, GRect(text_bounds.origin.x, y, text_bounds.size.w, content.h),
                        GTextOverflowModeFill, align, NULL);
+    if (s_sort_mode == SORT_TIME_ASC || s_sort_mode == SORT_TIME_DESC) {
+      int ax = bounds.size.w - TILE_PAD - 2;
+      int ay = 12;
+      draw_sort_arrow(ctx, ax, ay, s_sort_mode == SORT_TIME_ASC, GColorWhite);
+    }
     return;
   }
 #endif
 
   align = GTextAlignmentRight;
-  text_bounds = GRect(bounds.origin.x, bounds.origin.y, bounds.size.w - TILE_PAD, bounds.size.h);
+  text_bounds = GRect(bounds.origin.x, bounds.origin.y, bounds.size.w - right_inset, bounds.size.h);
 #endif
   GSize content = graphics_text_layout_get_content_size(s_header_buf, font, text_bounds,
                                                          GTextOverflowModeFill, align);
   int y = text_bounds.origin.y + (text_bounds.size.h - content.h) / 2;
   GRect draw_rect = GRect(text_bounds.origin.x, y, text_bounds.size.w, content.h);
   graphics_draw_text(ctx, s_header_buf, font, draw_rect, GTextOverflowModeFill, align, NULL);
+  if (s_sort_mode == SORT_TIME_ASC || s_sort_mode == SORT_TIME_DESC) {
+#if defined(PBL_ROUND)
+    int ax = (bounds.size.w + content.w) / 2 + 4;
+    int ay = 12;
+    draw_sort_arrow(ctx, ax, ay, s_sort_mode == SORT_TIME_ASC, GColorBlack);
+#else
+    int ax = bounds.size.w - TILE_PAD - 2;
+    int ay = 12;
+    draw_sort_arrow(ctx, ax, ay, s_sort_mode == SORT_TIME_ASC, GColorWhite);
+#endif
+  }
 }
 
 // Picks black or white text for a given fill so any user-chosen color (not
@@ -877,6 +1074,22 @@ static void draw_bell_icon(GContext *ctx, GPoint top, GColor color) {
   graphics_fill_circle(ctx, GPoint(top.x + 4, top.y + 10), 1);
 }
 
+// A tick, drawn from two thick strokes for the same reason the bell is drawn
+// from primitives — no image/PDC resources in this app. `top` is the glyph's
+// top-left; it occupies roughly a 9x9px area, matching the bell so the two
+// sit level in opposite corners of a tile.
+//
+// Stroke width is set explicitly and restored: the tile loop leaves it at 1
+// but also uses 3 for the selected tile's border, and inheriting whatever the
+// previous tile happened to set makes the tick randomly fat.
+static void draw_tick_icon(GContext *ctx, GPoint top, GColor color) {
+  graphics_context_set_stroke_color(ctx, color);
+  graphics_context_set_stroke_width(ctx, 2);
+  graphics_draw_line(ctx, GPoint(top.x + 1, top.y + 5), GPoint(top.x + 3, top.y + 8));
+  graphics_draw_line(ctx, GPoint(top.x + 3, top.y + 8), GPoint(top.x + 8, top.y + 1));
+  graphics_context_set_stroke_width(ctx, 1);
+}
+
 // graphics_draw_text always top-anchors within the given rect. That's fine
 // when the rect is already sized tightly to its content, but wherever a
 // rect is deliberately taller than one line so a short string still has
@@ -974,6 +1187,9 @@ static void grid_update_proc(Layer *layer, GContext *ctx) {
     if (ride_alert && ride_alert->enabled) {
       draw_bell_icon(ctx, GPoint(tile.origin.x + tile.size.w - 12, tile.origin.y + 2), text_color);
     }
+    if (r->flags & RIDE_FLAG_LOGGED_TODAY) {
+      draw_tick_icon(ctx, GPoint(tile.origin.x + 3, tile.origin.y + 2), text_color);
+    }
 
     graphics_context_set_text_color(ctx, text_color);
     GRect name_rect = GRect(tile.origin.x + 2, tile.origin.y + 1,
@@ -1042,9 +1258,10 @@ static void select_click_handler(ClickRecognizerRef recognizer, void *context) {
 }
 
 static void cycle_sort_mode(void) {
-  if (s_sort_mode == SORT_TIME) s_sort_mode = SORT_DISTANCE;
+  if (s_sort_mode == SORT_TIME_ASC) s_sort_mode = SORT_TIME_DESC;
+  else if (s_sort_mode == SORT_TIME_DESC) s_sort_mode = SORT_DISTANCE;
   else if (s_sort_mode == SORT_DISTANCE) s_sort_mode = SORT_ALERTS;
-  else s_sort_mode = SORT_TIME;
+  else s_sort_mode = SORT_TIME_ASC;
   persist_write_int(SETTINGS_SORT_KEY, s_sort_mode);
   recompute_order();
   update_header();
@@ -1104,14 +1321,8 @@ static void main_tap_handler(const Recognizer *recognizer, RecognizerEvent event
 
   // Tapping the top header bar cycles sort mode
   if (p.y < s_scroll_frame.origin.y) {
-    vibes_short_pulse();
-    s_sort_mode = (s_sort_mode == SORT_TIME) ? SORT_DISTANCE :
-                  (s_sort_mode == SORT_DISTANCE) ? SORT_ALERTS : SORT_TIME;
-    persist_write_int(SETTINGS_SORT_KEY, (int)s_sort_mode);
-    recompute_order();
-    update_header();
+    cycle_sort_mode();
     update_grid_layout();
-    layer_mark_dirty(s_grid_content_layer);
     return;
   }
 
@@ -1593,10 +1804,17 @@ static void detail_select_click_handler(ClickRecognizerRef recognizer, void *con
   toggle_alert_for_current_ride();
 }
 
+static void open_tracker_window(void);
+
+static void detail_select_long_click_handler(ClickRecognizerRef recognizer, void *context) {
+  open_tracker_window();
+}
+
 static void detail_click_config_provider(void *context) {
   window_single_repeating_click_subscribe(BUTTON_ID_UP, 200, detail_up_click_handler);
   window_single_repeating_click_subscribe(BUTTON_ID_DOWN, 200, detail_down_click_handler);
   window_single_click_subscribe(BUTTON_ID_SELECT, detail_select_click_handler);
+  window_long_click_subscribe(BUTTON_ID_SELECT, 500, detail_select_long_click_handler, NULL);
 #if PBL_API_EXISTS(tap_recognizer_create)
   window_multi_click_subscribe(BUTTON_ID_SELECT, 2, 0, 0, true, select_double_click_handler);
 #endif
@@ -1626,12 +1844,16 @@ static void detail_tap_handler(const Recognizer *recognizer, RecognizerEvent eve
   window_stack_pop(true);
 }
 
-// Either horizontal direction closes — permissive on purpose, since this
-// window has no other use for a horizontal swipe to compete with.
+// Swipe Left opens Ride Tracker; Swipe Right closes back to main grid
 static void detail_swipe_handler(const Recognizer *recognizer, RecognizerEvent event) {
   if (s_touch_locked) return;
   if (event != RecognizerEvent_Completed) return;
-  window_stack_pop(true);
+  SwipeDirection dir = swipe_recognizer_get_direction(recognizer);
+  if (dir == SwipeDirection_Left) {
+    open_tracker_window();
+  } else {
+    window_stack_pop(true);
+  }
 }
 #endif
 
@@ -1723,6 +1945,1241 @@ static void open_detail_window(void) {
 }
 
 // ---------------------------------------------------------------------------
+// Coaster Ride Tracker & Accelerometer 25Hz G-Force Engine
+
+static uint32_t int_sqrt(uint32_t n) {
+  uint32_t root = 0;
+  uint32_t bit = 1u << 30;
+  while (bit > n) bit >>= 2;
+  while (bit != 0) {
+    if (n >= root + bit) {
+      n -= root + bit;
+      root = (root >> 1) + bit;
+    } else {
+      root >>= 1;
+    }
+    bit >>= 2;
+  }
+  return root;
+}
+
+static void format_g_force(char *buf, size_t buf_len, int16_t mg) {
+  bool neg = (mg < 0);
+  if (neg) mg = -mg;
+  int whole = mg / 1000;
+  int frac = (mg % 1000) / 10;
+  if (neg) {
+    snprintf(buf, buf_len, "-%d.%02d G", whole, frac);
+  } else {
+    snprintf(buf, buf_len, "%d.%02d G", whole, frac);
+  }
+}
+
+#define TRACKER_MAX_SECONDS 300
+
+// Sample the accelerometer as fast as the SDK allows and compute every metric
+// at that full rate, but only *store* one sample in TRACKER_STORE_DECIMATION.
+//
+// Why: at the old 25Hz request we resolved to 12.5Hz (Nyquist) and
+// systematically under-read exactly the sharp spikes a coaster app exists to
+// measure — a peak lasting under 40ms could be missed outright. Asking for
+// 100Hz gets 104Hz of real hardware (see the ODR table below), so peak G,
+// the airtime run edges and roughness all get 4x the resolution.
+//
+// Storage stays at the old rate, so the buffer still covers the same ~96s of
+// wall clock and the exported telemetry is unchanged in size. Metric fidelity
+// is free; only raw resolution costs memory, and raw resolution is the part
+// nobody analyses at 100Hz anyway.
+//
+// The ODR ladder on the LSM6DSO (Pebble Time 2 / Pebble 2 Duo) is
+// 12.5/26/52/104/208Hz and the driver rounds a requested interval *up* to the
+// next rung, so ACCEL_SAMPLING_100HZ delivers 104Hz / 9615us, and the old
+// ACCEL_SAMPLING_25HZ was really 26Hz / 38461us — never the 40ms this code
+// used to assume. Nothing here hardcodes any of that; the real interval is
+// measured from AccelData.timestamp and shipped to the phone.
+#define TRACKER_SAMPLING_RATE 100
+#define TRACKER_STORE_DECIMATION 4
+#define TRACKER_NOMINAL_DT_MS 10
+// Interval between *stored* samples, used only as the phone's fallback.
+#define TRACKER_NOMINAL_STORED_DT_MS (TRACKER_NOMINAL_DT_MS * TRACKER_STORE_DECIMATION)
+
+// Samples per callback. At 104Hz this is ~10 wake-ups a second: enough to keep
+// the live G readout and the AIRTIME badge feeling immediate without waking
+// the app on every single sample.
+#define TRACKER_SAMPLES_PER_UPDATE 10
+
+// The accelerometer is configured +/-4g per axis (CONFIG_ACCEL_LSM6DSO_SCALE_MG
+// =4000), so anything at the rail is a floor, not a reading. Desk tests have
+// already reached 3892mg, so a real coaster will clip — count it and say so
+// rather than reporting a saturated peak as though it were real.
+#define TRACKER_CLIP_MG 3950
+
+// Vibration blanking. did_vibrate is set by the firmware as
+// `sys_vibe_get_vibe_strength() != VIBE_STRENGTH_OFF`, i.e. it is true only
+// while the motor is actually ON. It says nothing about the watch physically
+// ringing down afterwards, and a wrist keeps sloshing for a good while after a
+// 250ms buzz stops. Gating on the flag alone therefore leaves a tail of
+// corrupted samples that can still become the reported peak G.
+//
+// So: skip metrics for the whole motor-on window *plus* a settle period.
+// vibes_short_pulse() is 250ms (SHORT_PULSE_DURATIONS in PebbleOS), and
+// recording starts with one, hence the start blank. Any vibration mid-ride —
+// a system notification, say — re-arms the shorter ringdown blank.
+//
+// Cost: the first 400ms of a recording contributes no metrics. That is free in
+// practice (you press record before the train dispatches) and much cheaper
+// than a phantom 4g peak. It also conveniently covers the boxcar's warm-up,
+// where the window is still part-seeded with its fictitious 1.0g.
+#define TRACKER_VIBE_RINGDOWN_MS 150
+
+// Pressing SELECT starts a countdown rather than recording immediately: it
+// takes a second or two to get your arms back onto the restraints, and any
+// data from that is noise at best. It also disposes of the start-buzz problem
+// at the source — the last countdown buzz is a full second before recording
+// begins, so the watch has completely settled by then and there is no start
+// pulse to filter. The did_vibrate + ringdown blanking below stays anyway, for
+// vibration the tracker doesn't control (a notification arriving mid-ride).
+#define TRACKER_COUNTDOWN_SECONDS 3
+#define TRACKER_SPARKLINE_POINTS 60
+#define SAMPLES_PER_CHUNK 25
+
+// What this watch can and cannot measure, because it drives every threshold
+// below and a previous version of this code got it badly wrong:
+//
+// Available: a 3-axis accelerometer, and a *tilt-compensated magnetic heading
+// scalar* (compass_service gives a bearing, not the raw magnetometer vector).
+// There is no gyroscope on any Pebble — no API in any header, no symbol in
+// libpebble.a on any platform — so angular rate cannot be integrated.
+//
+// Consequence: **inversions are not detectable.** The old code tried, using
+// heading, and could never have worked. `magnetic_heading` is *yaw* — bearing
+// in the horizontal plane. A vertical loop is a pitch rotation: the train
+// enters and leaves on the same bearing, so heading barely moves; meanwhile a
+// flat helix sweeps a full 180 with no inversion at all. So heading counts
+// exactly the wrong thing. On top of that the heading is only valid while the
+// watch is roughly level, so it goes invalid *during* the very manoeuvre it
+// was meant to detect. And physically, inside a well-shaped loop the rider
+// feels positive G the whole way round, so the accelerometer can't separate
+// "upside down" from "hard flat turn" either. It's now a turn counter, which
+// is what the sensor actually supports.
+//
+// Everything else here is deliberately computed from the acceleration
+// *magnitude*, which is rotation-invariant — the one thing that stays true on
+// a wrist that's free to flail about.
+
+// Airtime: |a| below this is near free-fall. Rotation-invariant, so it holds
+// regardless of how the wrist is oriented.
+#define TRACKER_AIRTIME_MG 500
+// A run must last this long to count as a hill rather than a wrist flick.
+#define TRACKER_AIRTIME_MIN_MS 160
+// Sustained heavy positive G.
+#define TRACKER_HIGH_G_MG 2000
+// A turn is this much accumulated yaw in one direction. Accumulated by angle,
+// never by consecutive-tick runs: compass_service_set_heading_filter() only
+// emits an event every 5 degrees, so heading arrives as isolated jumps
+// separated by long stretches of zero change. The old detector required 8
+// consecutive ticks of >=2.5 degrees each and therefore never once fired on
+// real data — every candidate run died at length 1.
+#define TRACKER_TURN_TENTHS 900
+// Reversal bigger than this abandons the turn being accumulated.
+#define TRACKER_TURN_REVERSE_TENTHS 300
+// Per-sample dt is taken from AccelData.timestamp rather than assumed, but is
+// clamped so one bad/batched timestamp can't blow up an integration.
+#define TRACKER_DT_MIN_MS 4
+#define TRACKER_DT_MAX_MS 200
+
+typedef struct {
+  int16_t x;
+  int16_t y;
+  int16_t z;
+  uint16_t heading; // 0..3600 (0.1 degree units)
+} RawSensorSample;
+
+typedef enum {
+  TRACKER_STATE_IDLE = 0,
+  TRACKER_STATE_COUNTDOWN,
+  TRACKER_STATE_RECORDING,
+  TRACKER_STATE_SUMMARY
+} TrackerState;
+
+typedef enum {
+  TRACKER_SYNC_IDLE = 0,
+  TRACKER_SYNC_SENDING_START,
+  TRACKER_SYNC_SENDING_CHUNKS,
+  TRACKER_SYNC_SENDING_END,
+  TRACKER_SYNC_DONE,
+  TRACKER_SYNC_FAILED
+} TrackerSyncState;
+
+static Window *s_tracker_window = NULL;
+static Layer *s_tracker_header_layer = NULL;
+static Layer *s_tracker_main_layer = NULL;
+static Layer *s_tracker_action_layer = NULL;
+
+static TrackerState s_tracker_state = TRACKER_STATE_IDLE;
+static int32_t s_tracker_ride_id = -1;
+static char s_tracker_ride_name[NAME_BUF_LEN];
+
+static RawSensorSample *s_tracker_raw_samples = NULL;
+static uint16_t s_tracker_sample_count = 0;
+static uint16_t s_tracker_allocated_capacity = 0;
+
+static uint16_t s_tracker_current_heading = 0;
+static bool s_tracker_compass_ok = false;
+static TrackerSyncState s_tracker_sync_state = TRACKER_SYNC_IDLE;
+static uint16_t s_tracker_sync_offset = 0;
+static AppTimer *s_tracker_sync_timer = NULL;
+
+static int16_t s_tracker_live_g = 1000;
+
+// Extremum trackers seeded to sentinels, NOT to 1000. Seeding them at 1g meant
+// a ride that never crossed 1g reported a max (or min) of exactly 1.00g that
+// was never measured — and a stationary watch showed "Max 1.00 / Min 1.00",
+// which looks plausible enough that the bug hid. s_tracker_metric_samples
+// says whether either has been written at all.
+static int16_t s_tracker_max_g = 0;
+static int16_t s_tracker_min_g = INT16_MAX;
+static uint32_t s_tracker_metric_samples = 0;
+static uint32_t s_tracker_g_sum = 0;          // for the mean; mg * samples
+
+static uint32_t s_tracker_airtime_ms = 0;     // sustained runs only
+static uint32_t s_tracker_airtime_run_ms = 0; // the run in progress
+static uint32_t s_tracker_max_airtime_ms = 0; // longest single float
+static uint16_t s_tracker_airtime_hills = 0;
+static uint32_t s_tracker_high_g_ms = 0;
+
+// Ride roughness: mean |d|a|/dt| in mg per second, i.e. jerk magnitude. Also
+// orientation-independent, and the one number that actually distinguishes a
+// rattling old coaster from a smooth one.
+//
+// The sum is 64-bit deliberately. A single sample can contribute ~693000
+// (a 6928mg swing over a 10ms interval), and at 104Hz a 5-minute recording is
+// 31200 samples — around 2.2e10, comfortably past the 4.29e9 a uint32 holds.
+// It fitted at 26Hz; raising the rate is what breaks it.
+static uint64_t s_tracker_jerk_sum = 0;
+static uint32_t s_tracker_jerk_samples = 0;
+static int16_t s_tracker_prev_filtered_g = -1;
+
+// Samples whose peak axis sat at the +/-4g rail.
+static uint32_t s_tracker_clipped_samples = 0;
+
+// Counts down while the watch is buzzing or still ringing from it.
+static uint32_t s_tracker_vibe_blank_ms = 0;
+static uint8_t s_tracker_countdown = 0;
+static uint32_t s_tracker_blanked_samples = 0;
+
+// Yaw turns, accumulated by angle (see TRACKER_TURN_TENTHS).
+static uint16_t s_tracker_turn_count = 0;
+static uint32_t s_tracker_rotation_tenths = 0; // total absolute yaw swept
+static int32_t s_tracker_turn_accum = 0;
+static uint16_t s_tracker_last_heading = 0;
+static bool s_tracker_heading_valid = false;
+
+static uint64_t s_tracker_last_ts = 0;        // previous raw sample, for dt
+// First/last *stored* sample. The reported interval has to describe the stored
+// series, since that's what the phone reconstructs timestamps from — spanning
+// the raw series instead would understate it by the decimation factor.
+static uint64_t s_tracker_first_stored_ts = 0;
+static uint64_t s_tracker_last_stored_ts = 0;
+static uint8_t s_tracker_decim = 0;
+static uint16_t s_tracker_elapsed_sec = 0;
+static bool s_tracker_buffer_full = false;
+
+static int16_t s_tracker_window_buf[4] = {1000, 1000, 1000, 1000};
+static uint8_t s_tracker_window_idx = 0;
+
+static int16_t s_tracker_sparkline[TRACKER_SPARKLINE_POINTS];
+static uint8_t s_tracker_sparkline_count = 0;
+
+static AppTimer *s_tracker_timer = NULL;
+
+static void stop_tracker_recording(void);
+
+static void tracker_compass_handler(CompassHeadingData heading_data) {
+  // Only Calibrating and Calibrated carry usable data. The old guard was
+  // `!= CompassStatusUnavailable`, which also let CompassStatusDataInvalid (0)
+  // through — the SDK documents that one as "data is invalid and should not be
+  // used". s_tracker_heading_valid drops on bad data so the turn detector
+  // skips that interval outright rather than treating a stale heading as a
+  // real (zero) rotation, or a resync as a real jump.
+  if (heading_data.compass_status == CompassStatusCalibrated ||
+      heading_data.compass_status == CompassStatusCalibrating) {
+    uint32_t raw_h = (uint32_t)heading_data.magnetic_heading;
+    s_tracker_current_heading = (uint16_t)((raw_h * 3600) / TRIG_MAX_ANGLE);
+    s_tracker_compass_ok = true;
+  } else {
+    s_tracker_compass_ok = false;
+  }
+}
+
+static void tracker_second_tick(void *data) {
+  if (s_tracker_state == TRACKER_STATE_RECORDING) {
+    s_tracker_elapsed_sec++;
+    if (s_tracker_elapsed_sec >= TRACKER_MAX_SECONDS) {
+      stop_tracker_recording();
+      return;
+    }
+    if (s_tracker_header_layer) layer_mark_dirty(s_tracker_header_layer);
+    if (s_tracker_main_layer) layer_mark_dirty(s_tracker_main_layer);
+    s_tracker_timer = app_timer_register(1000, tracker_second_tick, NULL);
+  }
+}
+
+// Banks the turn currently being accumulated, if it ever got big enough to
+// count. Called on a direction reversal and once more when recording stops, so
+// the final turn of a ride isn't dropped for want of a reversal after it.
+static void tracker_bank_turn(void) {
+  int32_t abs_accum = s_tracker_turn_accum < 0 ? -s_tracker_turn_accum : s_tracker_turn_accum;
+  if (abs_accum >= TRACKER_TURN_TENTHS) s_tracker_turn_count++;
+  s_tracker_turn_accum = 0;
+}
+
+static void tracker_accel_data_handler(AccelData *data, uint32_t num_samples) {
+  for (uint32_t i = 0; i < num_samples; i++) {
+    int32_t x = data[i].x;
+    int32_t y = data[i].y;
+    int32_t z = data[i].z;
+    int32_t sq_sum = x * x + y * y + z * z;
+    int16_t inst_g = (int16_t)int_sqrt(sq_sum);
+
+    s_tracker_live_g = inst_g;
+
+    // 4-sample boxcar. Deliberately left at 4 samples rather than widened to
+    // preserve the old time constant: at 26Hz it spanned ~154ms, which averaged
+    // away genuine short airtime pops and cost real peak G; at 104Hz the same 4
+    // samples span ~38ms, which still rejects single-sample sensor noise but
+    // resolves events four times shorter. Measured on real rides, halving the
+    // rate from 26Hz to 13Hz alone cost 22% of one ride's raw peak — the
+    // reported peak is strongly rate-dependent, and this is the point of
+    // sampling fast.
+    s_tracker_window_buf[s_tracker_window_idx] = inst_g;
+    s_tracker_window_idx = (s_tracker_window_idx + 1) % 4;
+    int32_t filtered_sum = (int32_t)s_tracker_window_buf[0] + s_tracker_window_buf[1] +
+                           s_tracker_window_buf[2] + s_tracker_window_buf[3];
+    int16_t filtered_g = (int16_t)(filtered_sum / 4);
+
+    if (s_tracker_state != TRACKER_STATE_RECORDING) continue;
+
+    // Real elapsed time between samples. The old code assumed a flat 40ms;
+    // AccelData carries a genuine millisecond timestamp, and using it keeps
+    // the airtime/high-G integrals honest when the service batches or drops.
+    uint64_t ts = data[i].timestamp;
+    uint32_t dt_ms = TRACKER_NOMINAL_DT_MS;
+    if (s_tracker_last_ts != 0 && ts > s_tracker_last_ts) {
+      uint64_t delta = ts - s_tracker_last_ts;
+      if (delta < TRACKER_DT_MIN_MS) delta = TRACKER_DT_MIN_MS;
+      if (delta > TRACKER_DT_MAX_MS) delta = TRACKER_DT_MAX_MS;
+      dt_ms = (uint32_t)delta;
+    }
+    s_tracker_last_ts = ts;
+
+    // Decimated storage. The stored series must stay strictly uniform — the
+    // phone rebuilds timestamps as (index * interval) — so a sample lands
+    // whenever the counter comes round, vibration-tainted or not. Dropping one
+    // would shift every timestamp after it. Taint is handled below, where it
+    // belongs: by excluding the sample from the metrics.
+    if (++s_tracker_decim >= TRACKER_STORE_DECIMATION) {
+      s_tracker_decim = 0;
+      if (s_tracker_raw_samples && s_tracker_sample_count < s_tracker_allocated_capacity) {
+        s_tracker_raw_samples[s_tracker_sample_count].x = (int16_t)x;
+        s_tracker_raw_samples[s_tracker_sample_count].y = (int16_t)y;
+        s_tracker_raw_samples[s_tracker_sample_count].z = (int16_t)z;
+        s_tracker_raw_samples[s_tracker_sample_count].heading = s_tracker_current_heading;
+        s_tracker_sample_count++;
+        if (s_tracker_first_stored_ts == 0) s_tracker_first_stored_ts = ts;
+        s_tracker_last_stored_ts = ts;
+      } else {
+        // Metrics keep accumulating for the whole ride, but the raw stream
+        // stops here. Surfaced rather than silent: the summary and the
+        // exported CSV otherwise describe different spans with no hint.
+        s_tracker_buffer_full = true;
+      }
+    }
+
+    // Every metric below skips samples the watch's own vibration motor
+    // corrupted. The countdown means the tracker no longer buzzes at the
+    // moment recording starts, but vibration it does NOT control still
+    // happens — a notification arriving mid-ride — and a sharp spike will
+    // otherwise *become* the reported peak G.
+    //
+    // did_vibrate covers only the motor-on window; the blank extends past it
+    // to cover the ringdown (see TRACKER_VIBE_RINGDOWN_MS). The sample is
+    // still *stored* — the exported series has to stay uniform — it just
+    // doesn't feed any metric.
+    if (data[i].did_vibrate) {
+      s_tracker_vibe_blank_ms = TRACKER_VIBE_RINGDOWN_MS;
+      s_tracker_blanked_samples++;
+      continue;
+    }
+    if (s_tracker_vibe_blank_ms > 0) {
+      s_tracker_vibe_blank_ms = (dt_ms >= s_tracker_vibe_blank_ms)
+                                    ? 0 : (s_tracker_vibe_blank_ms - dt_ms);
+      s_tracker_blanked_samples++;
+      continue;
+    }
+
+    s_tracker_metric_samples++;
+    s_tracker_g_sum += (uint32_t)filtered_g;
+
+    // At the rail the sensor is reporting its own limit, not the ride.
+    int32_t peak_axis = x < 0 ? -x : x;
+    int32_t ay = y < 0 ? -y : y;
+    int32_t az = z < 0 ? -z : z;
+    if (ay > peak_axis) peak_axis = ay;
+    if (az > peak_axis) peak_axis = az;
+    if (peak_axis >= TRACKER_CLIP_MG) s_tracker_clipped_samples++;
+
+    if (filtered_g > s_tracker_max_g) s_tracker_max_g = filtered_g;
+    if (filtered_g < s_tracker_min_g) s_tracker_min_g = filtered_g;
+
+    if (s_tracker_prev_filtered_g >= 0) {
+      int32_t d_g = (int32_t)filtered_g - s_tracker_prev_filtered_g;
+      if (d_g < 0) d_g = -d_g;
+      // mg per second, so the figure doesn't depend on the sample rate.
+      s_tracker_jerk_sum += (uint64_t)((d_g * 1000) / (int32_t)dt_ms);
+      s_tracker_jerk_samples++;
+    }
+    s_tracker_prev_filtered_g = filtered_g;
+
+    if (filtered_g >= TRACKER_HIGH_G_MG) s_tracker_high_g_ms += dt_ms;
+
+    // Airtime. A run only counts once it has lasted TRACKER_AIRTIME_MIN_MS,
+    // and then the whole run counts — including the part before the threshold
+    // was reached. The old version added every sub-0.5g sample to the total
+    // while requiring 4 in a row for a "hill", so the two numbers described
+    // different things and could not be reconciled.
+    if (filtered_g < TRACKER_AIRTIME_MG) {
+      uint32_t was = s_tracker_airtime_run_ms;
+      s_tracker_airtime_run_ms += dt_ms;
+      if (was < TRACKER_AIRTIME_MIN_MS && s_tracker_airtime_run_ms >= TRACKER_AIRTIME_MIN_MS) {
+        s_tracker_airtime_hills++;
+        s_tracker_airtime_ms += s_tracker_airtime_run_ms;  // backfill the run so far
+      } else if (was >= TRACKER_AIRTIME_MIN_MS) {
+        s_tracker_airtime_ms += dt_ms;
+      }
+      if (s_tracker_airtime_run_ms > s_tracker_max_airtime_ms &&
+          s_tracker_airtime_run_ms >= TRACKER_AIRTIME_MIN_MS) {
+        s_tracker_max_airtime_ms = s_tracker_airtime_run_ms;
+      }
+    } else {
+      s_tracker_airtime_run_ms = 0;
+    }
+
+    // Yaw turns. Accumulate the angle itself; never require consecutive ticks.
+    // A reversal past TRACKER_TURN_REVERSE_TENTHS abandons the turn in
+    // progress, so a wrist waggling back and forth cannot ratchet up a count.
+    if (s_tracker_compass_ok) {
+      if (!s_tracker_heading_valid) {
+        // First valid heading, or the first after a dropout: establish a
+        // reference without charging the gap to the rider as rotation.
+        s_tracker_last_heading = s_tracker_current_heading;
+        s_tracker_heading_valid = true;
+      } else {
+        int16_t d_heading = (int16_t)s_tracker_current_heading - (int16_t)s_tracker_last_heading;
+        if (d_heading > 1800) d_heading -= 3600;
+        else if (d_heading < -1800) d_heading += 3600;
+        s_tracker_last_heading = s_tracker_current_heading;
+
+        if (d_heading != 0) {
+          int32_t abs_dh = d_heading < 0 ? -d_heading : d_heading;
+          s_tracker_rotation_tenths += (uint32_t)abs_dh;
+
+          // A turn is banked when the yaw *reverses*, not every 90 degrees.
+          // Counting per-90 would make this number a near-duplicate of
+          // rotation_tenths (helix of 360 = "4 turns"); banking on reversal
+          // makes the pair complementary — "7 turns, 1260 degrees swept" says
+          // considerably more than either does alone, and one long helix reads
+          // as the single continuous turn a rider would call it.
+          bool reversing = (s_tracker_turn_accum > 0 && d_heading < 0) ||
+                           (s_tracker_turn_accum < 0 && d_heading > 0);
+          if (reversing && abs_dh >= TRACKER_TURN_REVERSE_TENTHS) {
+            tracker_bank_turn();
+            s_tracker_turn_accum = d_heading;
+          } else {
+            s_tracker_turn_accum += d_heading;
+          }
+        }
+      }
+    } else {
+      s_tracker_heading_valid = false;
+    }
+
+    if (s_tracker_elapsed_sec >= TRACKER_MAX_SECONDS) {
+      stop_tracker_recording();
+      return;
+    }
+  }
+
+  if (s_tracker_main_layer) layer_mark_dirty(s_tracker_main_layer);
+}
+
+static void send_next_tracker_chunk(void *data);
+static void tracker_chunk_timer_callback(void *data);
+static void start_tracker_sync_to_phone(void);
+
+// Summary accessors. All of them answer "nothing measured" with 0 rather than
+// with the sentinel the accumulator happens to hold, so a recording that
+// captured no clean samples (every one vibration-tainted, say) reports zeros
+// instead of INT16_MAX.
+
+static int16_t tracker_summary_max_g(void) {
+  return s_tracker_metric_samples ? s_tracker_max_g : 0;
+}
+
+// |a|, so this bottoms out at 0 (true free-fall) and can never be negative.
+// Coaster telemetry conventionally quotes *negative* G during airtime, but
+// that is signed acceleration along the rider's vertical axis, and recovering
+// it needs an orientation this hardware can't supply: with no gyro the only
+// vertical reference is a low-passed accelerometer, which on a coaster is
+// measuring sustained centripetal force rather than gravity — wrong in
+// exactly the moments that matter. Reported honestly as a magnitude instead.
+static int16_t tracker_summary_min_g(void) {
+  return s_tracker_metric_samples ? s_tracker_min_g : 0;
+}
+
+static int16_t tracker_summary_avg_g(void) {
+  if (!s_tracker_metric_samples) return 0;
+  return (int16_t)(s_tracker_g_sum / s_tracker_metric_samples);
+}
+
+static uint16_t tracker_summary_roughness(void) {
+  if (!s_tracker_jerk_samples) return 0;
+  uint64_t r = s_tracker_jerk_sum / s_tracker_jerk_samples;
+  return r > UINT16_MAX ? UINT16_MAX : (uint16_t)r;
+}
+
+// Measured mean sample interval in tenths of a millisecond, so the phone can
+// timestamp the exported telemetry from what the accelerometer actually did
+// rather than from a hardcoded 40ms.
+static uint16_t tracker_summary_interval_tenths(void) {
+  if (s_tracker_sample_count < 2 || s_tracker_last_stored_ts <= s_tracker_first_stored_ts) {
+    return TRACKER_NOMINAL_STORED_DT_MS * 10;
+  }
+  uint64_t span = s_tracker_last_stored_ts - s_tracker_first_stored_ts;
+  uint32_t interval = (uint32_t)((span * 10) / (s_tracker_sample_count - 1));
+  if (interval < TRACKER_DT_MIN_MS * 10 ||
+      interval > TRACKER_DT_MAX_MS * TRACKER_STORE_DECIMATION * 10) {
+    return TRACKER_NOMINAL_STORED_DT_MS * 10;
+  }
+  return (uint16_t)interval;
+}
+
+static void tracker_sync_start_timer_callback(void *data) {
+  start_tracker_sync_to_phone();
+}
+
+static void start_tracker_sync_to_phone(void) {
+  if (s_tracker_sample_count == 0 || !s_tracker_raw_samples) return;
+  s_tracker_sync_state = TRACKER_SYNC_SENDING_START;
+  s_tracker_sync_offset = 0;
+  if (s_tracker_header_layer) layer_mark_dirty(s_tracker_header_layer);
+
+  uint32_t retry_ms = s_phone_connected ? 150 : 2000;
+
+  DictionaryIterator *iter;
+  AppMessageResult res = app_message_outbox_begin(&iter);
+  if (res == APP_MSG_OK) {
+    dict_write_uint8(iter, MESSAGE_KEY_RideLogStart, 1);
+    dict_write_int32(iter, MESSAGE_KEY_RideLogRideId, s_tracker_ride_id);
+    dict_write_cstring(iter, MESSAGE_KEY_RideLogRideName, s_tracker_ride_name);
+    dict_write_uint16(iter, MESSAGE_KEY_RideLogDuration, s_tracker_elapsed_sec);
+    // Both extrema are |a| — a vector magnitude, so never negative. Sent as
+    // int16 for wire compatibility, but a "min G" below zero is not a thing
+    // this hardware can produce; see the note by tracker_summary_min_g().
+    dict_write_int16(iter, MESSAGE_KEY_RideLogMaxG, tracker_summary_max_g());
+    dict_write_int16(iter, MESSAGE_KEY_RideLogMinG, tracker_summary_min_g());
+    dict_write_int16(iter, MESSAGE_KEY_RideLogAvgG, tracker_summary_avg_g());
+    dict_write_uint32(iter, MESSAGE_KEY_RideLogAirtimeMs, s_tracker_airtime_ms);
+    dict_write_uint16(iter, MESSAGE_KEY_RideLogAirtimeHills, s_tracker_airtime_hills);
+    dict_write_uint32(iter, MESSAGE_KEY_RideLogMaxAirtimeMs, s_tracker_max_airtime_ms);
+    dict_write_uint32(iter, MESSAGE_KEY_RideLogHighGMs, s_tracker_high_g_ms);
+    dict_write_uint16(iter, MESSAGE_KEY_RideLogTurns, s_tracker_turn_count);
+    dict_write_uint16(iter, MESSAGE_KEY_RideLogRotationDeg,
+                      (uint16_t)(s_tracker_rotation_tenths / 10));
+    dict_write_uint16(iter, MESSAGE_KEY_RideLogRoughness, tracker_summary_roughness());
+    dict_write_uint16(iter, MESSAGE_KEY_RideLogSampleIntervalMs, tracker_summary_interval_tenths());
+    dict_write_uint8(iter, MESSAGE_KEY_RideLogTruncated, s_tracker_buffer_full ? 1 : 0);
+    dict_write_uint16(iter, MESSAGE_KEY_RideLogClipped,
+                      s_tracker_clipped_samples > UINT16_MAX
+                          ? UINT16_MAX : (uint16_t)s_tracker_clipped_samples);
+    dict_write_uint16(iter, MESSAGE_KEY_RideLogTotalSamples, s_tracker_sample_count);
+    AppMessageResult send_res = app_message_outbox_send();
+    if (send_res != APP_MSG_OK) {
+      if (s_tracker_sync_timer) app_timer_cancel(s_tracker_sync_timer);
+      s_tracker_sync_timer = app_timer_register(retry_ms, tracker_sync_start_timer_callback, NULL);
+    }
+  } else {
+    if (s_tracker_sync_timer) app_timer_cancel(s_tracker_sync_timer);
+    s_tracker_sync_timer = app_timer_register(retry_ms, tracker_sync_start_timer_callback, NULL);
+  }
+}
+
+static void send_next_tracker_chunk(void *data) {
+  s_tracker_sync_timer = NULL;
+  if (s_tracker_sync_state != TRACKER_SYNC_SENDING_CHUNKS && s_tracker_sync_state != TRACKER_SYNC_SENDING_END) return;
+  if (!s_tracker_raw_samples || s_tracker_sample_count == 0) {
+    s_tracker_sync_state = TRACKER_SYNC_DONE;
+    if (s_tracker_header_layer) layer_mark_dirty(s_tracker_header_layer);
+    return;
+  }
+
+  uint32_t retry_ms = s_phone_connected ? 150 : 2000;
+
+  if (s_tracker_sync_offset >= s_tracker_sample_count) {
+    s_tracker_sync_state = TRACKER_SYNC_SENDING_END;
+    DictionaryIterator *iter;
+    AppMessageResult res = app_message_outbox_begin(&iter);
+    if (res == APP_MSG_OK) {
+      dict_write_uint8(iter, MESSAGE_KEY_RideLogEnd, 1);
+      dict_write_uint16(iter, MESSAGE_KEY_RideLogTotalSamples, s_tracker_sample_count);
+      AppMessageResult send_res = app_message_outbox_send();
+      if (send_res != APP_MSG_OK) {
+        if (s_tracker_sync_timer) app_timer_cancel(s_tracker_sync_timer);
+        s_tracker_sync_timer = app_timer_register(retry_ms, tracker_chunk_timer_callback, NULL);
+      }
+    } else {
+      if (s_tracker_sync_timer) app_timer_cancel(s_tracker_sync_timer);
+      s_tracker_sync_timer = app_timer_register(retry_ms, tracker_chunk_timer_callback, NULL);
+    }
+    return;
+  }
+
+  uint16_t remaining = s_tracker_sample_count - s_tracker_sync_offset;
+  uint8_t count = remaining > SAMPLES_PER_CHUNK ? SAMPLES_PER_CHUNK : (uint8_t)remaining;
+
+  uint8_t chunk_buf[3 + (SAMPLES_PER_CHUNK * 8)];
+  chunk_buf[0] = (uint8_t)(s_tracker_sync_offset >> 8);
+  chunk_buf[1] = (uint8_t)(s_tracker_sync_offset & 0xFF);
+  chunk_buf[2] = count;
+
+  uint16_t byte_idx = 3;
+  for (uint8_t i = 0; i < count; i++) {
+    RawSensorSample *s = &s_tracker_raw_samples[s_tracker_sync_offset + i];
+    chunk_buf[byte_idx++] = (uint8_t)((uint16_t)s->x >> 8);
+    chunk_buf[byte_idx++] = (uint8_t)((uint16_t)s->x & 0xFF);
+    chunk_buf[byte_idx++] = (uint8_t)((uint16_t)s->y >> 8);
+    chunk_buf[byte_idx++] = (uint8_t)((uint16_t)s->y & 0xFF);
+    chunk_buf[byte_idx++] = (uint8_t)((uint16_t)s->z >> 8);
+    chunk_buf[byte_idx++] = (uint8_t)((uint16_t)s->z & 0xFF);
+    chunk_buf[byte_idx++] = (uint8_t)(s->heading >> 8);
+    chunk_buf[byte_idx++] = (uint8_t)(s->heading & 0xFF);
+  }
+
+  DictionaryIterator *iter;
+  AppMessageResult res = app_message_outbox_begin(&iter);
+  if (res == APP_MSG_OK) {
+    dict_write_data(iter, MESSAGE_KEY_RideLogChunk, chunk_buf, byte_idx);
+    AppMessageResult send_res = app_message_outbox_send();
+    if (send_res == APP_MSG_OK) {
+      s_tracker_sync_offset += count;
+    } else {
+      if (s_tracker_sync_timer) app_timer_cancel(s_tracker_sync_timer);
+      s_tracker_sync_timer = app_timer_register(retry_ms, tracker_chunk_timer_callback, NULL);
+    }
+  } else {
+    if (s_tracker_sync_timer) app_timer_cancel(s_tracker_sync_timer);
+    s_tracker_sync_timer = app_timer_register(retry_ms, tracker_chunk_timer_callback, NULL);
+  }
+}
+
+static void begin_tracker_recording(void) {
+  if (s_tracker_state == TRACKER_STATE_RECORDING) return;
+
+  if (s_tracker_sync_timer) {
+    app_timer_cancel(s_tracker_sync_timer);
+    s_tracker_sync_timer = NULL;
+  }
+  s_tracker_sync_state = TRACKER_SYNC_IDLE;
+
+  if (!s_tracker_raw_samples) {
+#if defined(PBL_PLATFORM_EMERY)
+    static const uint16_t try_caps[] = { 4000, 3000, 2000, 1000, 500 };
+#elif defined(PBL_PLATFORM_APLITE)
+    static const uint16_t try_caps[] = { 300, 150, 0 };
+#else
+    static const uint16_t try_caps[] = { 2500, 2000, 1500, 1000, 600, 300 };
+#endif
+    s_tracker_allocated_capacity = 0;
+    for (size_t c = 0; c < sizeof(try_caps)/sizeof(try_caps[0]); c++) {
+      if (try_caps[c] == 0) break;
+      s_tracker_raw_samples = malloc(try_caps[c] * sizeof(RawSensorSample));
+      if (s_tracker_raw_samples) {
+        s_tracker_allocated_capacity = try_caps[c];
+        break;
+      }
+    }
+  }
+  s_tracker_sample_count = 0;
+  s_tracker_buffer_full = false;
+  s_tracker_live_g = 1000;
+  s_tracker_max_g = 0;
+  s_tracker_min_g = INT16_MAX;
+  s_tracker_metric_samples = 0;
+  s_tracker_g_sum = 0;
+  s_tracker_airtime_ms = 0;
+  s_tracker_airtime_run_ms = 0;
+  s_tracker_max_airtime_ms = 0;
+  s_tracker_airtime_hills = 0;
+  s_tracker_high_g_ms = 0;
+  s_tracker_jerk_sum = 0;
+  s_tracker_jerk_samples = 0;
+  s_tracker_prev_filtered_g = -1;
+  s_tracker_clipped_samples = 0;
+  s_tracker_decim = 0;
+  s_tracker_vibe_blank_ms = 0;
+  s_tracker_blanked_samples = 0;
+  s_tracker_turn_count = 0;
+  s_tracker_rotation_tenths = 0;
+  s_tracker_turn_accum = 0;
+  s_tracker_heading_valid = false;
+  s_tracker_last_ts = 0;
+  s_tracker_first_stored_ts = 0;
+  s_tracker_last_stored_ts = 0;
+  s_tracker_elapsed_sec = 0;
+  s_tracker_sparkline_count = 0;
+  for (int i = 0; i < 4; i++) s_tracker_window_buf[i] = 1000;
+  s_tracker_window_idx = 0;
+
+  s_tracker_state = TRACKER_STATE_RECORDING;
+  // Deliberately no buzz here. The countdown's final pulse fired a second ago,
+  // which is both the "go" signal and long enough for the watch to stop
+  // ringing — buzzing now would put a ~4g spike into the first samples of
+  // every recording, which is exactly the bug this replaced.
+
+  if (s_tracker_timer) {
+    app_timer_cancel(s_tracker_timer);
+    s_tracker_timer = NULL;
+  }
+  s_tracker_timer = app_timer_register(1000, tracker_second_tick, NULL);
+
+  if (s_tracker_header_layer) layer_mark_dirty(s_tracker_header_layer);
+  if (s_tracker_main_layer) layer_mark_dirty(s_tracker_main_layer);
+  if (s_tracker_action_layer) layer_mark_dirty(s_tracker_action_layer);
+}
+
+static void tracker_countdown_tick(void *data) {
+  s_tracker_timer = NULL;
+  if (s_tracker_state != TRACKER_STATE_COUNTDOWN) return;
+
+  if (s_tracker_countdown > 0) s_tracker_countdown--;
+
+  if (s_tracker_countdown == 0) {
+    begin_tracker_recording();
+    return;
+  }
+
+  vibes_short_pulse();
+  if (s_tracker_header_layer) layer_mark_dirty(s_tracker_header_layer);
+  if (s_tracker_main_layer) layer_mark_dirty(s_tracker_main_layer);
+  s_tracker_timer = app_timer_register(1000, tracker_countdown_tick, NULL);
+}
+
+static void start_tracker_countdown(void) {
+  if (s_tracker_state == TRACKER_STATE_COUNTDOWN ||
+      s_tracker_state == TRACKER_STATE_RECORDING) return;
+
+  s_tracker_state = TRACKER_STATE_COUNTDOWN;
+  s_tracker_countdown = TRACKER_COUNTDOWN_SECONDS;
+  vibes_short_pulse();
+
+  if (s_tracker_timer) app_timer_cancel(s_tracker_timer);
+  s_tracker_timer = app_timer_register(1000, tracker_countdown_tick, NULL);
+
+  if (s_tracker_header_layer) layer_mark_dirty(s_tracker_header_layer);
+  if (s_tracker_main_layer) layer_mark_dirty(s_tracker_main_layer);
+  if (s_tracker_action_layer) layer_mark_dirty(s_tracker_action_layer);
+}
+
+// Abandoning the countdown before it fires, so a mistimed press isn't a
+// committed recording.
+static void cancel_tracker_countdown(void) {
+  if (s_tracker_state != TRACKER_STATE_COUNTDOWN) return;
+  if (s_tracker_timer) {
+    app_timer_cancel(s_tracker_timer);
+    s_tracker_timer = NULL;
+  }
+  s_tracker_state = TRACKER_STATE_IDLE;
+  s_tracker_countdown = 0;
+  if (s_tracker_header_layer) layer_mark_dirty(s_tracker_header_layer);
+  if (s_tracker_main_layer) layer_mark_dirty(s_tracker_main_layer);
+  if (s_tracker_action_layer) layer_mark_dirty(s_tracker_action_layer);
+}
+
+static void stop_tracker_recording(void) {
+  if (s_tracker_state != TRACKER_STATE_RECORDING) return;
+
+  s_tracker_state = TRACKER_STATE_SUMMARY;
+  tracker_bank_turn();
+  APP_LOG(APP_LOG_LEVEL_INFO,
+          "tracker: %u metric samples, %u blanked (vibe), %u clipped, %u stored",
+          (unsigned)s_tracker_metric_samples, (unsigned)s_tracker_blanked_samples,
+          (unsigned)s_tracker_clipped_samples, (unsigned)s_tracker_sample_count);
+  // Safe here: state is already SUMMARY, so the handler ignores what follows.
+  vibes_double_pulse();
+
+  if (s_tracker_timer) {
+    app_timer_cancel(s_tracker_timer);
+    s_tracker_timer = NULL;
+  }
+
+  if (s_tracker_sample_count > 0 && s_tracker_raw_samples) {
+    uint8_t target_pts = TRACKER_SPARKLINE_POINTS;
+    if (s_tracker_sample_count < target_pts) target_pts = (uint8_t)s_tracker_sample_count;
+    s_tracker_sparkline_count = target_pts;
+
+    for (uint8_t i = 0; i < target_pts; i++) {
+      uint32_t idx = (i * (s_tracker_sample_count - 1)) / (target_pts - 1 > 0 ? target_pts - 1 : 1);
+      int32_t sx = s_tracker_raw_samples[idx].x;
+      int32_t sy = s_tracker_raw_samples[idx].y;
+      int32_t sz = s_tracker_raw_samples[idx].z;
+      s_tracker_sparkline[i] = (int16_t)int_sqrt(sx * sx + sy * sy + sz * sz);
+    }
+  }
+
+  start_tracker_sync_to_phone();
+
+  if (s_tracker_header_layer) layer_mark_dirty(s_tracker_header_layer);
+  if (s_tracker_main_layer) layer_mark_dirty(s_tracker_main_layer);
+  if (s_tracker_action_layer) layer_mark_dirty(s_tracker_action_layer);
+}
+
+static void tracker_header_update_proc(Layer *layer, GContext *ctx) {
+  GRect bounds = layer_get_bounds(layer);
+  graphics_context_set_fill_color(ctx, GColorBlack);
+  graphics_fill_rect(ctx, bounds, 0, GCornerNone);
+
+  char left_buf[48];
+  char right_buf[32];
+  left_buf[0] = '\0';
+  right_buf[0] = '\0';
+
+  if (s_tracker_state == TRACKER_STATE_IDLE) {
+    snprintf(left_buf, sizeof(left_buf), "[LOGGER] %s", s_tracker_ride_name);
+    snprintf(right_buf, sizeof(right_buf), "Ready");
+  } else if (s_tracker_state == TRACKER_STATE_COUNTDOWN) {
+    snprintf(left_buf, sizeof(left_buf), "%s", s_tracker_ride_name);
+    snprintf(right_buf, sizeof(right_buf), "Get set");
+  } else if (s_tracker_state == TRACKER_STATE_RECORDING) {
+    snprintf(left_buf, sizeof(left_buf), "REC");
+    int min = s_tracker_elapsed_sec / 60;
+    int sec = s_tracker_elapsed_sec % 60;
+    snprintf(right_buf, sizeof(right_buf), "%02d:%02d/5m", min, sec);
+  } else if (s_tracker_state == TRACKER_STATE_SUMMARY) {
+    snprintf(left_buf, sizeof(left_buf), "%s", s_tracker_ride_name);
+    if (s_tracker_sync_state == TRACKER_SYNC_SENDING_START || s_tracker_sync_state == TRACKER_SYNC_SENDING_CHUNKS) {
+      snprintf(right_buf, sizeof(right_buf), "Syncing...");
+    } else if (s_tracker_sync_state == TRACKER_SYNC_DONE) {
+      snprintf(right_buf, sizeof(right_buf), "Saved");
+    } else {
+      snprintf(right_buf, sizeof(right_buf), "Summary");
+    }
+  }
+
+  graphics_context_set_text_color(ctx, GColorWhite);
+  GFont font = fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD);
+
+  graphics_draw_text(ctx, left_buf, font,
+      GRect(bounds.origin.x + 4, bounds.origin.y + 1, bounds.size.w - 74, bounds.size.h - 2),
+      GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
+
+  graphics_draw_text(ctx, right_buf, font,
+      GRect(bounds.origin.x + bounds.size.w - 70, bounds.origin.y + 1, 66, bounds.size.h - 2),
+      GTextOverflowModeFill, GTextAlignmentRight, NULL);
+}
+
+static void tracker_main_update_proc(Layer *layer, GContext *ctx) {
+  GRect bounds = layer_get_bounds(layer);
+
+  if (s_tracker_state == TRACKER_STATE_IDLE) {
+    graphics_context_set_fill_color(ctx, GColorWhite);
+    graphics_fill_rect(ctx, bounds, 0, GCornerNone);
+
+    char g_str[16];
+    format_g_force(g_str, sizeof(g_str), s_tracker_live_g);
+
+    graphics_context_set_text_color(ctx, GColorBlack);
+    graphics_draw_text(ctx, "RIDE G-TRACKER", fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD),
+        GRect(bounds.origin.x, bounds.origin.y + 8, bounds.size.w, 22),
+        GTextOverflowModeFill, GTextAlignmentCenter, NULL);
+
+    graphics_context_set_text_color(ctx, PBL_IF_COLOR_ELSE(GColorDarkGreen, GColorBlack));
+    graphics_draw_text(ctx, g_str, fonts_get_system_font(FONT_KEY_GOTHIC_28_BOLD),
+        GRect(bounds.origin.x, bounds.origin.y + 32, bounds.size.w, 32),
+        GTextOverflowModeFill, GTextAlignmentCenter, NULL);
+
+    graphics_context_set_text_color(ctx, PBL_IF_COLOR_ELSE(GColorDarkGray, GColorBlack));
+    graphics_draw_text(ctx, "Current Resting G-Force", fonts_get_system_font(FONT_KEY_GOTHIC_14),
+        GRect(bounds.origin.x, bounds.origin.y + 64, bounds.size.w, 18),
+        GTextOverflowModeFill, GTextAlignmentCenter, NULL);
+
+    graphics_context_set_text_color(ctx, GColorBlack);
+    graphics_draw_text(ctx, "Press SELECT to Start\n(Max 5m duration)", fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD),
+        GRect(bounds.origin.x + 8, bounds.origin.y + 86, bounds.size.w - 16, 36),
+        GTextOverflowModeWordWrap, GTextAlignmentCenter, NULL);
+
+  } else if (s_tracker_state == TRACKER_STATE_COUNTDOWN) {
+    graphics_context_set_fill_color(ctx, GColorWhite);
+    graphics_fill_rect(ctx, bounds, 0, GCornerNone);
+
+    graphics_context_set_text_color(ctx, GColorBlack);
+    graphics_draw_text(ctx, "GET READY", fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD),
+        GRect(bounds.origin.x, bounds.origin.y + 6, bounds.size.w, 22),
+        GTextOverflowModeFill, GTextAlignmentCenter, NULL);
+
+    char count_buf[4];
+    snprintf(count_buf, sizeof(count_buf), "%d", (int)s_tracker_countdown);
+    graphics_context_set_text_color(ctx, PBL_IF_COLOR_ELSE(GColorRed, GColorBlack));
+    graphics_draw_text(ctx, count_buf, fonts_get_system_font(FONT_KEY_BITHAM_42_BOLD),
+        GRect(bounds.origin.x, bounds.origin.y + 28, bounds.size.w, 46),
+        GTextOverflowModeFill, GTextAlignmentCenter, NULL);
+
+    graphics_context_set_text_color(ctx, GColorBlack);
+    graphics_draw_text(ctx, "Hands on the restraints\nRecording starts at 0",
+        fonts_get_system_font(FONT_KEY_GOTHIC_14),
+        GRect(bounds.origin.x + 6, bounds.origin.y + 78, bounds.size.w - 12, 36),
+        GTextOverflowModeWordWrap, GTextAlignmentCenter, NULL);
+
+  } else if (s_tracker_state == TRACKER_STATE_RECORDING) {
+    graphics_context_set_fill_color(ctx, GColorWhite);
+    graphics_fill_rect(ctx, bounds, 0, GCornerNone);
+
+    char g_str[16];
+    format_g_force(g_str, sizeof(g_str), s_tracker_live_g);
+
+    GColor g_color = PBL_IF_COLOR_ELSE(GColorDarkGreen, GColorBlack);
+    const char *badge_text = "LIVE G-FORCE";
+
+    if (s_tracker_live_g < 500) {
+      g_color = PBL_IF_COLOR_ELSE(GColorVividCerulean, GColorBlack);
+      badge_text = "AIRTIME!";
+    } else if (s_tracker_live_g > 3000) {
+      g_color = PBL_IF_COLOR_ELSE(GColorRed, GColorBlack);
+      badge_text = "EXTREME G!";
+    } else if (s_tracker_live_g > 2000) {
+      g_color = PBL_IF_COLOR_ELSE(GColorChromeYellow, GColorBlack);
+      badge_text = "HIGH G-FORCE";
+    }
+
+    graphics_context_set_text_color(ctx, g_color);
+    graphics_draw_text(ctx, badge_text, fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD),
+        GRect(bounds.origin.x, bounds.origin.y + 4, bounds.size.w, 18),
+        GTextOverflowModeFill, GTextAlignmentCenter, NULL);
+
+    graphics_draw_text(ctx, g_str, fonts_get_system_font(FONT_KEY_BITHAM_30_BLACK),
+        GRect(bounds.origin.x, bounds.origin.y + 20, bounds.size.w, 36),
+        GTextOverflowModeFill, GTextAlignmentCenter, NULL);
+
+    int bar_x = bounds.origin.x + 12;
+    int bar_y = bounds.origin.y + 60;
+    int bar_w = bounds.size.w - 24;
+    int bar_h = 10;
+
+    graphics_context_set_fill_color(ctx, PBL_IF_COLOR_ELSE(GColorLightGray, GColorWhite));
+    graphics_fill_rect(ctx, GRect(bar_x, bar_y, bar_w, bar_h), 2, GCornersAll);
+    graphics_context_set_stroke_color(ctx, GColorBlack);
+    graphics_draw_round_rect(ctx, GRect(bar_x, bar_y, bar_w, bar_h), 2);
+
+    int fill_w = (s_tracker_live_g * (bar_w - 2)) / 5000;
+    if (fill_w < 0) fill_w = 0;
+    if (fill_w > bar_w - 2) fill_w = bar_w - 2;
+
+    if (fill_w > 0) {
+      graphics_context_set_fill_color(ctx, g_color);
+      graphics_fill_rect(ctx, GRect(bar_x + 1, bar_y + 1, fill_w, bar_h - 2), 1, GCornersAll);
+    }
+
+    int tick_x = bar_x + (1000 * (bar_w - 2)) / 5000;
+    graphics_context_set_stroke_color(ctx, GColorBlack);
+    graphics_draw_line(ctx, GPoint(tick_x, bar_y), GPoint(tick_x, bar_y + bar_h));
+
+    char ribbon_buf[48];
+    int air_sec = s_tracker_airtime_ms / 1000;
+    int air_dec = (s_tracker_airtime_ms % 1000) / 100;
+    char max_g_buf[16];
+    format_g_force(max_g_buf, sizeof(max_g_buf), tracker_summary_max_g());
+
+    snprintf(ribbon_buf, sizeof(ribbon_buf), "Max:%s | Air:%d.%ds", max_g_buf, air_sec, air_dec);
+    graphics_context_set_text_color(ctx, GColorBlack);
+    graphics_draw_text(ctx, ribbon_buf, fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD),
+        GRect(bounds.origin.x + 4, bounds.origin.y + 76, bounds.size.w - 8, 20),
+        GTextOverflowModeFill, GTextAlignmentCenter, NULL);
+
+  } else if (s_tracker_state == TRACKER_STATE_SUMMARY) {
+    graphics_context_set_fill_color(ctx, GColorWhite);
+    graphics_fill_rect(ctx, bounds, 0, GCornerNone);
+
+    char max_buf[16], min_buf[16];
+    format_g_force(max_buf, sizeof(max_buf), tracker_summary_max_g());
+    format_g_force(min_buf, sizeof(min_buf), tracker_summary_min_g());
+
+    int air_sec = s_tracker_airtime_ms / 1000;
+    int air_dec = (s_tracker_airtime_ms % 1000) / 100;
+    int best_air_sec = s_tracker_max_airtime_ms / 1000;
+    int best_air_dec = (s_tracker_max_airtime_ms % 1000) / 100;
+
+    int dur_min = s_tracker_elapsed_sec / 60;
+    int dur_sec = s_tracker_elapsed_sec % 60;
+
+    // The watch shows the headline numbers; avg G, roughness, high-G time and
+    // total rotation all still go to the phone and into the exported CSV/JSON,
+    // which is where anyone actually comparing rides will be looking.
+    char row1[48], row2[48], row3[48];
+    snprintf(row1, sizeof(row1), "Max %s  Min %s", max_buf, min_buf);
+    snprintf(row2, sizeof(row2), "Air %d.%ds (%d) best %d.%ds",
+             air_sec, air_dec, s_tracker_airtime_hills, best_air_sec, best_air_dec);
+    // "Turns", not "Inversions" — see the sensor note at the top of this
+    // section. Truncation is called out because the summary covers the whole
+    // ride while the exported telemetry stops at the buffer.
+    snprintf(row3, sizeof(row3), "%d turns  %d:%02d%s",
+             s_tracker_turn_count, dur_min, dur_sec,
+             s_tracker_buffer_full ? " (part)" : "");
+
+    graphics_context_set_text_color(ctx, GColorBlack);
+    graphics_draw_text(ctx, row1, fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD),
+        GRect(bounds.origin.x + 4, bounds.origin.y + 1, bounds.size.w - 8, 15),
+        GTextOverflowModeFill, GTextAlignmentCenter, NULL);
+
+    graphics_draw_text(ctx, row2, fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD),
+        GRect(bounds.origin.x + 4, bounds.origin.y + 15, bounds.size.w - 8, 15),
+        GTextOverflowModeFill, GTextAlignmentCenter, NULL);
+
+    graphics_draw_text(ctx, row3, fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD),
+        GRect(bounds.origin.x + 4, bounds.origin.y + 29, bounds.size.w - 8, 15),
+        GTextOverflowModeFill, GTextAlignmentCenter, NULL);
+
+    int graph_x = bounds.origin.x + 6;
+    int graph_y = bounds.origin.y + 47;
+    int graph_w = bounds.size.w - 12;
+    int graph_h = bounds.size.h - 49;
+
+    graphics_context_set_fill_color(ctx, PBL_IF_COLOR_ELSE(GColorLightGray, GColorWhite));
+    graphics_fill_rect(ctx, GRect(graph_x, graph_y, graph_w, graph_h), 2, GCornersAll);
+    graphics_context_set_stroke_color(ctx, GColorBlack);
+    graphics_draw_round_rect(ctx, GRect(graph_x, graph_y, graph_w, graph_h), 2);
+
+    int ref_y = graph_y + graph_h - (1000 * graph_h) / 5000;
+    graphics_context_set_stroke_color(ctx, PBL_IF_COLOR_ELSE(GColorDarkGray, GColorBlack));
+    for (int x = graph_x + 2; x < graph_x + graph_w - 2; x += 4) {
+      graphics_draw_pixel(ctx, GPoint(x, ref_y));
+    }
+
+    if (s_tracker_sparkline_count >= 2) {
+      for (uint8_t i = 1; i < s_tracker_sparkline_count; i++) {
+        int x0 = graph_x + 2 + ((i - 1) * (graph_w - 4)) / (s_tracker_sparkline_count - 1);
+        int x1 = graph_x + 2 + (i * (graph_w - 4)) / (s_tracker_sparkline_count - 1);
+
+        int16_t mg0 = s_tracker_sparkline[i - 1];
+        int16_t mg1 = s_tracker_sparkline[i];
+
+        int y0 = graph_y + graph_h - 2 - (mg0 * (graph_h - 4)) / 5000;
+        int y1 = graph_y + graph_h - 2 - (mg1 * (graph_h - 4)) / 5000;
+
+        if (y0 < graph_y + 2) y0 = graph_y + 2;
+        if (y0 > graph_y + graph_h - 2) y0 = graph_y + graph_h - 2;
+        if (y1 < graph_y + 2) y1 = graph_y + 2;
+        if (y1 > graph_y + graph_h - 2) y1 = graph_y + graph_h - 2;
+
+        if (mg1 < 800) {
+          graphics_context_set_stroke_color(ctx, PBL_IF_COLOR_ELSE(GColorVividCerulean, GColorBlack));
+        } else if (mg1 > 2500) {
+          graphics_context_set_stroke_color(ctx, PBL_IF_COLOR_ELSE(GColorRed, GColorBlack));
+        } else {
+          graphics_context_set_stroke_color(ctx, PBL_IF_COLOR_ELSE(GColorDarkGreen, GColorBlack));
+        }
+        graphics_draw_line(ctx, GPoint(x0, y0), GPoint(x1, y1));
+      }
+    }
+  }
+}
+
+static void tracker_action_update_proc(Layer *layer, GContext *ctx) {
+  GRect bounds = layer_get_bounds(layer);
+  graphics_context_set_fill_color(ctx, GColorBlack);
+  graphics_fill_rect(ctx, bounds, 0, GCornerNone);
+
+  const char *action_text = "Press SELECT to Start";
+  if (s_tracker_state == TRACKER_STATE_COUNTDOWN) {
+    action_text = "SELECT to Cancel";
+  } else if (s_tracker_state == TRACKER_STATE_RECORDING) {
+    action_text = "Stop Recording (SELECT)";
+  } else if (s_tracker_state == TRACKER_STATE_SUMMARY) {
+    action_text = "Record Again (SELECT)";
+  }
+
+  graphics_context_set_text_color(ctx, GColorWhite);
+  graphics_draw_text(ctx, action_text, fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD),
+      GRect(bounds.origin.x, bounds.origin.y + 1, bounds.size.w, bounds.size.h - 2),
+      GTextOverflowModeFill, GTextAlignmentCenter, NULL);
+}
+
+static void tracker_select_click_handler(ClickRecognizerRef recognizer, void *context) {
+  if (s_tracker_state == TRACKER_STATE_IDLE ||
+      s_tracker_state == TRACKER_STATE_SUMMARY) {
+    start_tracker_countdown();
+  } else if (s_tracker_state == TRACKER_STATE_COUNTDOWN) {
+    cancel_tracker_countdown();
+  } else if (s_tracker_state == TRACKER_STATE_RECORDING) {
+    stop_tracker_recording();
+  }
+}
+
+static void tracker_click_config_provider(void *context) {
+  window_single_click_subscribe(BUTTON_ID_SELECT, tracker_select_click_handler);
+}
+
+#if PBL_API_EXISTS(tap_recognizer_create)
+static void tracker_tap_handler(const Recognizer *recognizer, RecognizerEvent event) {
+  if (s_touch_locked) return;
+  if (event != RecognizerEvent_Completed) return;
+
+  if (s_tracker_state == TRACKER_STATE_IDLE ||
+      s_tracker_state == TRACKER_STATE_SUMMARY) {
+    start_tracker_countdown();
+  } else if (s_tracker_state == TRACKER_STATE_COUNTDOWN) {
+    cancel_tracker_countdown();
+  } else if (s_tracker_state == TRACKER_STATE_RECORDING) {
+    stop_tracker_recording();
+  }
+}
+
+static void tracker_swipe_handler(const Recognizer *recognizer, RecognizerEvent event) {
+  if (s_touch_locked) return;
+  if (event != RecognizerEvent_Completed) return;
+  window_stack_pop(true);
+}
+#endif
+
+static void tracker_window_load(Window *window) {
+  Layer *root = window_get_root_layer(window);
+  GRect bounds = layer_get_bounds(root);
+
+  window_set_click_config_provider(window, tracker_click_config_provider);
+
+#if PBL_API_EXISTS(tap_recognizer_create)
+  Recognizer *tap = tap_recognizer_create(tracker_tap_handler, NULL);
+  Recognizer *swipe = swipe_recognizer_create(tracker_swipe_handler, NULL,
+      SwipeDirection_Right);
+  recognizer_set_simultaneous_with(tap, always_simultaneous);
+  recognizer_set_simultaneous_with(swipe, always_simultaneous);
+  window_attach_recognizer(window, tap);
+  window_attach_recognizer(window, swipe);
+  window_set_touch_bridge_disabled(window, true);
+#endif
+
+#if defined(PBL_ROUND)
+  int diameter = bounds.size.w;
+  int square_side = (diameter * 707) / 1000;
+  GRect area = GRect((bounds.size.w - square_side) / 2, (bounds.size.h - square_side) / 2,
+                      square_side, square_side);
+#else
+  GRect area = bounds;
+#endif
+
+  s_tracker_header_layer = layer_create(GRect(area.origin.x, area.origin.y, area.size.w, 20));
+  layer_set_update_proc(s_tracker_header_layer, tracker_header_update_proc);
+  layer_add_child(root, s_tracker_header_layer);
+
+  s_tracker_action_layer = layer_create(GRect(area.origin.x, area.origin.y + area.size.h - 22,
+                                              area.size.w, 22));
+  layer_set_update_proc(s_tracker_action_layer, tracker_action_update_proc);
+  layer_add_child(root, s_tracker_action_layer);
+
+  s_tracker_main_layer = layer_create(GRect(area.origin.x, area.origin.y + 20, area.size.w,
+                                            area.size.h - 20 - 22));
+  layer_set_update_proc(s_tracker_main_layer, tracker_main_update_proc);
+  layer_add_child(root, s_tracker_main_layer);
+
+  // Subscribe FIRST, then set the rate. The sampling rate is a property of an
+  // active accel session, so setting it before subscribing is a no-op — and
+  // the call returns a status this code used to throw away. With the rate not
+  // taking, the service ran at whatever the default was, which is exactly the
+  // kind of thing the old hardcoded "25Hz = 40ms per sample" assumption could
+  // never have revealed.
+  accel_data_service_subscribe(TRACKER_SAMPLES_PER_UPDATE, tracker_accel_data_handler);
+  int rate_res = accel_service_set_sampling_rate(ACCEL_SAMPLING_100HZ);
+  if (rate_res != 0) {
+    APP_LOG(APP_LOG_LEVEL_WARNING, "accel rate set failed (%d); running at default", rate_res);
+  }
+
+  // 5 degrees. Coarse, but it is the compass service's own event threshold, so
+  // heading arrives as sparse jumps rather than a smooth signal — which is why
+  // the turn detector accumulates angle instead of requiring consecutive ticks.
+  compass_service_set_heading_filter(TRIG_MAX_ANGLE / 72);
+  compass_service_subscribe(tracker_compass_handler);
+}
+
+static void tracker_window_unload(Window *window) {
+  accel_data_service_unsubscribe();
+  compass_service_unsubscribe();
+
+  if (s_tracker_timer) {
+    app_timer_cancel(s_tracker_timer);
+    s_tracker_timer = NULL;
+  }
+
+  // If sync is not actively in progress, free samples immediately.
+  // If sync is still streaming chunks to the phone in the background, leave
+  // the buffer and timer intact — tracker_free_samples_if_unused(), called
+  // from outbox_sent_callback when the sync finishes, frees them then.
+  if (s_tracker_sync_state == TRACKER_SYNC_IDLE || s_tracker_sync_state == TRACKER_SYNC_DONE) {
+    if (s_tracker_sync_timer) {
+      app_timer_cancel(s_tracker_sync_timer);
+      s_tracker_sync_timer = NULL;
+    }
+    if (s_tracker_raw_samples) {
+      free(s_tracker_raw_samples);
+      s_tracker_raw_samples = NULL;
+    }
+    s_tracker_allocated_capacity = 0;
+    s_tracker_sample_count = 0;
+    s_tracker_sync_state = TRACKER_SYNC_IDLE;
+  }
+
+  layer_destroy(s_tracker_header_layer);
+  s_tracker_header_layer = NULL;
+  layer_destroy(s_tracker_main_layer);
+  s_tracker_main_layer = NULL;
+  layer_destroy(s_tracker_action_layer);
+  s_tracker_action_layer = NULL;
+
+  window_destroy(window);
+  s_tracker_window = NULL;
+  s_tracker_ride_id = -1;
+}
+
+static void open_tracker_window(void) {
+  if (s_detail_ride_id < 0) return;
+
+  s_tracker_ride_id = s_detail_ride_id;
+  strncpy(s_tracker_ride_name, s_detail_name, NAME_BUF_LEN - 1);
+  s_tracker_ride_name[NAME_BUF_LEN - 1] = '\0';
+  s_tracker_state = TRACKER_STATE_IDLE;
+  s_tracker_live_g = 1000;
+  s_tracker_max_g = 1000;
+  s_tracker_min_g = 1000;
+  s_tracker_airtime_ms = 0;
+  s_tracker_airtime_hills = 0;
+  s_tracker_elapsed_sec = 0;
+
+  // Deliberately NOT resetting s_tracker_sample_count here. Backing out of
+  // the tracker leaves an unfinished sync streaming in the background (see
+  // tracker_window_unload), and that sync reads the count to know where the
+  // buffer ends. Zeroing it on re-entry made send_next_tracker_chunk take its
+  // "nothing to send" path: it jumped to TRACKER_SYNC_DONE without ever
+  // sending RideLogEnd, so the phone kept a half-filled session forever and
+  // never uploaded it. Nothing in the IDLE view reads the count anyway, and
+  // begin_tracker_recording() zeroes it at the point it's actually safe to.
+
+  s_tracker_window = window_create();
+  window_set_background_color(s_tracker_window, GColorWhite);
+  window_set_window_handlers(s_tracker_window, (WindowHandlers) {
+    .load   = tracker_window_load,
+    .unload = tracker_window_unload,
+  });
+  window_stack_push(s_tracker_window, true);
+}
+
+// ---------------------------------------------------------------------------
 // AppMessage receiving
 
 static void inbox_received_callback(DictionaryIterator *iter, void *context) {
@@ -1736,19 +3193,21 @@ static void inbox_received_callback(DictionaryIterator *iter, void *context) {
       uint32_t offset = 1;
       int valid_rides = 0;
       for (int i = 0; i < count && offset < len; i++) {
-        if (offset + 11 > len) break;
+        if (offset + 12 > len) break;
         int32_t id = (int32_t)(((uint32_t)bytes[offset] << 24) | ((uint32_t)bytes[offset + 1] << 16) | ((uint32_t)bytes[offset + 2] << 8) | (uint32_t)bytes[offset + 3]);
         offset += 4;
         int16_t wait = (int16_t)(((uint16_t)bytes[offset] << 8) | (uint16_t)bytes[offset + 1]);
         offset += 2;
         int32_t dist = (int32_t)(((uint32_t)bytes[offset] << 24) | ((uint32_t)bytes[offset + 1] << 16) | ((uint32_t)bytes[offset + 2] << 8) | (uint32_t)bytes[offset + 3]);
         offset += 4;
+        uint8_t flags = bytes[offset++];
         uint8_t name_len = bytes[offset++];
         if (offset + name_len > len) break;
 
         s_rides[i].ride_id = id;
         s_rides[i].wait_minutes = wait;
         s_rides[i].distance_m = dist;
+        s_rides[i].flags = flags;
         uint8_t copy_len = name_len < (NAME_BUF_LEN - 1) ? name_len : (NAME_BUF_LEN - 1);
         memcpy(s_rides[i].name, &bytes[offset], copy_len);
         s_rides[i].name[copy_len] = '\0';
@@ -1965,13 +3424,76 @@ static void retry_request_graph_callback(void *data) {
   request_graph(s_pending_graph_retry_id);
 }
 
+static void tracker_chunk_timer_callback(void *data) {
+  send_next_tracker_chunk(NULL);
+}
+
+// Releases the raw-sample buffer (up to ~20KB — by far this app's largest
+// allocation) once nothing needs it any more: the sync has finished and the
+// tracker window is closed. Backing out mid-sync deliberately keeps the buffer
+// alive so the transfer can finish, and this is what reclaims it afterwards;
+// without it that memory stayed leaked for the rest of the app's life. While
+// the window is still open the buffer stays put, so "Record Again" doesn't
+// have to gamble on a fresh allocation succeeding.
+static void tracker_free_samples_if_unused(void) {
+  if (s_tracker_window) return;
+  if (s_tracker_sync_state != TRACKER_SYNC_DONE &&
+      s_tracker_sync_state != TRACKER_SYNC_IDLE &&
+      s_tracker_sync_state != TRACKER_SYNC_FAILED) return;
+  if (s_tracker_sync_timer) {
+    app_timer_cancel(s_tracker_sync_timer);
+    s_tracker_sync_timer = NULL;
+  }
+  if (s_tracker_raw_samples) {
+    free(s_tracker_raw_samples);
+    s_tracker_raw_samples = NULL;
+  }
+  s_tracker_allocated_capacity = 0;
+  s_tracker_sample_count = 0;
+  s_tracker_sync_state = TRACKER_SYNC_IDLE;
+}
+
+static void outbox_sent_callback(DictionaryIterator *iter, void *context) {
+  if (s_tracker_sync_state == TRACKER_SYNC_SENDING_START) {
+    s_tracker_sync_state = TRACKER_SYNC_SENDING_CHUNKS;
+    if (s_tracker_sync_timer) {
+      app_timer_cancel(s_tracker_sync_timer);
+      s_tracker_sync_timer = NULL;
+    }
+    s_tracker_sync_timer = app_timer_register(30, tracker_chunk_timer_callback, NULL);
+  } else if (s_tracker_sync_state == TRACKER_SYNC_SENDING_CHUNKS) {
+    if (s_tracker_sync_timer) {
+      app_timer_cancel(s_tracker_sync_timer);
+      s_tracker_sync_timer = NULL;
+    }
+    s_tracker_sync_timer = app_timer_register(30, tracker_chunk_timer_callback, NULL);
+  } else if (s_tracker_sync_state == TRACKER_SYNC_SENDING_END) {
+    s_tracker_sync_state = TRACKER_SYNC_DONE;
+    if (s_tracker_header_layer) layer_mark_dirty(s_tracker_header_layer);
+    tracker_free_samples_if_unused();
+  }
+}
+
 static void outbox_failed_callback(DictionaryIterator *iter, AppMessageResult reason, void *context) {
   APP_LOG(APP_LOG_LEVEL_ERROR, "Outbox failed: %d", (int)reason);
 
-  // Phone-to-watch sends already retry via sendNext() in pkjs; these
-  // watch-initiated requests just got silently dropped before. Retry once
-  // after a short delay instead of waiting for the next periodic refresh
-  // tick, or making the user back out and reopen a ride's detail view.
+  if (s_tracker_sync_state == TRACKER_SYNC_SENDING_CHUNKS ||
+      s_tracker_sync_state == TRACKER_SYNC_SENDING_START ||
+      s_tracker_sync_state == TRACKER_SYNC_SENDING_END) {
+    if (s_tracker_sync_timer) {
+      app_timer_cancel(s_tracker_sync_timer);
+      s_tracker_sync_timer = NULL;
+    }
+    if (s_tracker_sync_state == TRACKER_SYNC_SENDING_START) {
+      s_tracker_sync_timer = app_timer_register(250, tracker_sync_start_timer_callback, NULL);
+    } else {
+      s_tracker_sync_timer = app_timer_register(250, tracker_chunk_timer_callback, NULL);
+    }
+    return;
+  }
+
+  if (!iter) return;
+
   Tuple *t_refresh = dict_find(iter, MESSAGE_KEY_RequestRefresh);
   if (t_refresh) {
     app_timer_register(3000, retry_request_refresh_callback, NULL);
@@ -1987,6 +3509,16 @@ static void outbox_failed_callback(DictionaryIterator *iter, AppMessageResult re
 static void connection_handler(bool connected) {
   s_phone_connected = connected;
   update_header();
+
+  if (connected) {
+    if (s_tracker_sync_state == TRACKER_SYNC_SENDING_START) {
+      if (s_tracker_sync_timer) app_timer_cancel(s_tracker_sync_timer);
+      s_tracker_sync_timer = app_timer_register(100, tracker_sync_start_timer_callback, NULL);
+    } else if (s_tracker_sync_state == TRACKER_SYNC_SENDING_CHUNKS || s_tracker_sync_state == TRACKER_SYNC_SENDING_END) {
+      if (s_tracker_sync_timer) app_timer_cancel(s_tracker_sync_timer);
+      s_tracker_sync_timer = app_timer_register(100, tracker_chunk_timer_callback, NULL);
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -2008,24 +3540,7 @@ static void main_window_load(Window *window) {
   // (chalk): the clock read ".s:25" instead of "23:25" before this offset.
 #if defined(PBL_ROUND)
   static const int ROUND_HEADER_Y_OFFSET = 14;
-  s_clock_layer = NULL;
-  s_header_layer = layer_create(GRect(0, ROUND_HEADER_Y_OFFSET, bounds.size.w, HEADER_HEIGHT));
-#else
-  s_clock_layer = layer_create(GRect(0, 0, HEADER_CLOCK_WIDTH, HEADER_HEIGHT));
-  layer_set_update_proc(s_clock_layer, clock_update_proc);
-  layer_add_child(root, s_clock_layer);
-
-  // Full remaining width: the background fill needs to reach the screen's
-  // true right edge (see header_update_proc for how the text itself still
-  // gets an inset from it, without shrinking the fill to match).
-  s_header_layer = layer_create(GRect(HEADER_CLOCK_WIDTH, 0, bounds.size.w - HEADER_CLOCK_WIDTH, HEADER_HEIGHT));
 #endif
-  layer_set_update_proc(s_header_layer, header_update_proc);
-  layer_add_child(root, s_header_layer);
-
-  tick_timer_service_subscribe(MINUTE_UNIT, clock_tick_handler);
-  update_clock();
-
   // s_scroll_frame is in root-layer (window) space — it positions the whole
   // scrollable viewport, inset on round platforms so it clears the bezel
   // regardless of which row is currently scrolled to the top/bottom edge.
@@ -2053,6 +3568,25 @@ static void main_window_load(Window *window) {
   layer_set_update_proc(s_grid_content_layer, grid_update_proc);
   scroll_layer_add_child(s_scroll_layer, s_grid_content_layer);
   layer_add_child(root, scroll_layer_get_layer(s_scroll_layer));
+
+#if defined(PBL_ROUND)
+  s_clock_layer = NULL;
+  s_header_layer = layer_create(GRect(0, ROUND_HEADER_Y_OFFSET, bounds.size.w, HEADER_HEIGHT));
+#else
+  s_clock_layer = layer_create(GRect(0, 0, HEADER_CLOCK_WIDTH, HEADER_HEIGHT));
+  layer_set_update_proc(s_clock_layer, clock_update_proc);
+  layer_add_child(root, s_clock_layer);
+
+  // Full remaining width: the background fill needs to reach the screen's
+  // true right edge (see header_update_proc for how the text itself still
+  // gets an inset from it, without shrinking the fill to match).
+  s_header_layer = layer_create(GRect(HEADER_CLOCK_WIDTH, 0, bounds.size.w - HEADER_CLOCK_WIDTH, HEADER_HEIGHT));
+#endif
+  layer_set_update_proc(s_header_layer, header_update_proc);
+  layer_add_child(root, s_header_layer);
+
+  tick_timer_service_subscribe(MINUTE_UNIT, clock_tick_handler);
+  update_clock();
   // Deliberately not using scroll_layer_set_click_config_onto_window(): that
   // wires UP/DOWN straight to raw pixel scrolling, which would bypass our
   // own tile-cursor model. Our click_config_provider drives scrolling
@@ -2094,7 +3628,10 @@ static void main_window_unload(Window *window) {
 
 static void init(void) {
   if (persist_exists(SETTINGS_SORT_KEY)) {
-    s_sort_mode = (SortMode)persist_read_int(SETTINGS_SORT_KEY);
+    int sm = persist_read_int(SETTINGS_SORT_KEY);
+    if (sm >= 0 && sm < SORT_MODE_COUNT) {
+      s_sort_mode = (SortMode)sm;
+    }
   }
   load_alerts();
   load_band_config();
@@ -2138,7 +3675,8 @@ static void init(void) {
   app_message_register_inbox_received(inbox_received_callback);
   app_message_register_inbox_dropped(inbox_dropped_callback);
   app_message_register_outbox_failed(outbox_failed_callback);
-  app_message_open(app_message_inbox_size_maximum(), app_message_outbox_size_maximum());
+  app_message_register_outbox_sent(outbox_sent_callback);
+  app_message_open(2048, 512);
 
   request_refresh();
   s_refresh_timer = app_timer_register(REFRESH_INTERVAL_MS, refresh_timer_callback, NULL);
