@@ -723,6 +723,93 @@ test('the settings page shows the empty state when nothing has been recorded', (
   assert.ok(document.querySelector('#rideLogsContainer').textContent.indexOf('No rides recorded yet') !== -1);
 });
 
+test('session recovers when RideLogStart is lost and RideLogEnd carries summary metrics', () => {
+  const pkjs = loadPkjs();
+  const am = pkjs.__handlers.appmessage;
+
+  // No RideLogStart sent (e.g. phone was disconnected / Bluetooth packet dropped).
+  // Chunks arrive first:
+  am({ payload: { RideLogChunk: asEmulatorByteArray(chunkBytes(0, SAMPLES_A)) } });
+  am({ payload: { RideLogChunk: asEmulatorByteArray(chunkBytes(2, SAMPLES_B)) } });
+
+  // RideLogEnd arrives with redundant summary stats snapshot:
+  am({
+    payload: {
+      RideLogEnd: 1,
+      RideLogRideId: 101,
+      RideLogRideName: 'Zadra',
+      RideLogDuration: 95,
+      RideLogMaxG: 4100,
+      RideLogMinG: 120,
+      RideLogAvgG: 1250,
+      RideLogAirtimeMs: 2500,
+      RideLogAirtimeHills: 3,
+      RideLogTurns: 6,
+      RideLogTotalSamples: 3
+    }
+  });
+
+  const logs = savedLogs(pkjs);
+  assert.strictEqual(logs.length, 1);
+  assert.strictEqual(logs[0].rideName, 'Zadra');
+  assert.strictEqual(logs[0].durationSec, 95);
+  assert.strictEqual(logs[0].summary.maxG, 4.1);
+  assert.strictEqual(logs[0].summary.minG, 0.12);
+  assert.strictEqual(logs[0].summary.avgG, 1.25);
+  assert.strictEqual(logs[0].summary.airtimeSec, 2.5);
+  assert.strictEqual(logs[0].summary.turns, 6);
+  assert.strictEqual(logs[0].samples.length, 3);
+});
+
+test('recomputeSummaryFromSamples computes non-zero stats directly from raw samples when watch stats are zero or missing', () => {
+  const pkjs = loadPkjs();
+  const am = pkjs.__handlers.appmessage;
+
+  // Chunks arrive with no start packet, and end arrives with zero metrics:
+  am({ payload: { RideLogChunk: asEmulatorByteArray(chunkBytes(0, SAMPLES_A)) } });
+  am({ payload: { RideLogChunk: asEmulatorByteArray(chunkBytes(2, SAMPLES_B)) } });
+  am({
+    payload: {
+      RideLogEnd: 1,
+      RideLogDuration: 0,
+      RideLogMaxG: 0,
+      RideLogMinG: 0,
+      RideLogAvgG: 0
+    }
+  });
+
+  const logs = savedLogs(pkjs);
+  assert.strictEqual(logs.length, 1);
+  const sm = logs[0].summary;
+  // SAMPLES_A has |g| = 1.02 and 2.57; SAMPLES_B has 1.0
+  assert.ok(sm.maxG >= 2.5, 'maxG should be recomputed from samples (~2.57), got: ' + sm.maxG);
+  assert.ok(sm.minG > 0 && sm.minG <= 1.02, 'minG should be recomputed (~1.0), got: ' + sm.minG);
+  assert.ok(sm.avgG > 1.0, 'avgG should be non-zero mean (~1.53), got: ' + sm.avgG);
+  assert.ok(logs[0].durationSec >= 0, 'duration should be valid');
+});
+
+test('settings page heals zeroed stats using raw samples if an old log had 0 maxG', () => {
+  const pkjs = loadPkjs({ storageSeed: {
+    coasterwatch_ride_logs: JSON.stringify([{
+      id: 'old_zero_ride',
+      rideId: 101,
+      rideName: 'Hyperion',
+      recordedAt: new Date().toISOString(),
+      durationSec: 0,
+      summary: { maxG: 0, minG: 0, avgG: 0, totalSamples: 2 },
+      samples: [[0, 0, 0, 1000, 1.0, 0], [40, 0, 0, 3500, 3.5, 0]]
+    }])
+  } });
+
+  const { document } = renderSettingsPage(pkjs);
+  const card = document.querySelector('#rideLogsContainer .rl-card');
+  assert.ok(card, 'card should render');
+  const values = Array.from(card.querySelectorAll('.rl-val')).map((el) => el.textContent);
+  // Peak should show 3.50G, not 0.00G or --G
+  assert.strictEqual(values[0], '3.50G');
+  assert.strictEqual(values[1], '1.00G');
+});
+
 if (failures.length) {
   console.log('\n' + passed + ' passed, ' + failures.length + ' failed');
   failures.forEach((f) => { console.log('\n--- ' + f.name); console.log(f.e && f.e.stack); });

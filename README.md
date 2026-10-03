@@ -22,8 +22,9 @@ Live roller-coaster queue times on your Pebble, powered by
   buzzed the moment it drops below it. Pick a vibration pattern (Standard,
   Nudge, Mario, Heartbeat), a highlight colour, and the tile/graph reflect
   the armed/triggered state live.
-- **Multi-park support** — currently Energylandia (Poland) and Thorpe Park
-  (UK), each remembering its own ride selection independently.
+- **Multi-park support** — currently Energylandia (Poland), Thorpe Park
+  (UK), and Chessington World of Adventures (UK), each remembering its own
+  ride selection independently.
 - **Settings page** built with [Clay](https://github.com/pebble-dev/clay):
   pick your park, choose which rides to track (with a Coasterpedia/park-site
   info link per ride so you can check it out before enabling it), set tile

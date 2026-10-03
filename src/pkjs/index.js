@@ -292,6 +292,108 @@ var THORPE_ROSTER = [
   ]}
 ];
 
+// Chessington World of Adventures (UK), queue-times.com park id 3.
+// themeparks.wiki park entity id: ae959d1f-9fcc-4aab-8063-71e641fa57f4.
+// All 33 attractions in the roster matched against themeparks.wiki coordinates.
+var CHESSINGTON_COORDS = {
+  4574:  { lat: 51.348609, lng: -0.316996 }, // Adventure Tree Carousel
+  67:    { lat: 51.348146, lng: -0.317246 }, // Elmer's Flying Jumbos
+  80:    { lat: 51.348089, lng: -0.317654 }, // Tiny Truckers
+  8691:  { lat: 51.348959, lng: -0.318568 }, // Croc Drop
+  85:    { lat: 51.348981, lng: -0.319376 }, // Tomb Blaster
+  62:    { lat: 51.347893, lng: -0.318147 }, // Canopy Capers
+  65:    { lat: 51.347937, lng: -0.319153 }, // Dragon's Fury
+  66:    { lat: 51.348088, lng: -0.317989 }, // Dragon's Playhouse - Soft Play
+  87:    { lat: 51.347800, lng: -0.317447 }, // Griffin's Galleon
+  77:    { lat: 51.347857, lng: -0.318348 }, // Sea Dragons
+  64:    { lat: 51.348404, lng: -0.320853 }, // Tiger Rock
+  74:    { lat: 51.348739, lng: -0.317820 }, // Rattlesnake
+  10889: { lat: 51.347906, lng: -0.316926 }, // Barrel Bail Out!
+  60:    { lat: 51.347495, lng: -0.316931 }, // Blue Barnacle
+  78:    { lat: 51.348148, lng: -0.316583 }, // Seastorm
+  10890: { lat: 51.347977, lng: -0.316562 }, // Trawler Trouble
+  7336:  { lat: 51.348222, lng: -0.318820 }, // Jungle Rangers
+  7976:  { lat: 51.348525, lng: -0.319182 }, // River Rafts
+  69:    { lat: 51.348385, lng: -0.318663 }, // Treetop Hoppers
+  84:    { lat: 51.349609, lng: -0.319236 }, // ZUFARI
+  4535:  { lat: 51.347756, lng: -0.315685 }, // The Gruffalo River Ride Adventure
+  83:    { lat: 51.347393, lng: -0.315634 }, // Vampire
+  11862: { lat: 51.347419, lng: -0.317815 }, // Mamba Strike
+  11814: { lat: 51.347158, lng: -0.317562 }, // Mandrill Mayhem
+  11861: { lat: 51.347330, lng: -0.318464 }, // Ostrich Stampede
+  16457: { lat: 51.349378, lng: -0.318040 }, // Chase's Mountain Mission
+  16459: { lat: 51.349441, lng: -0.317603 }, // Marshall's Firetruck Rescue
+  16466: { lat: 51.349227, lng: -0.317643 }, // Rubble & Rocky's Play Zone
+  16458: { lat: 51.349076, lng: -0.317939 }, // Skye's Helicopter Heroes
+  16460: { lat: 51.349046, lng: -0.317316 }, // Zuma's Hovercraft Adventure
+  59:    { lat: 51.349513, lng: -0.316756 }, // AMAZU: Treetop Adventure
+  6381:  { lat: 51.348870, lng: -0.315999 }, // Room on the Broom - A Magical Journey
+  14467: { lat: 51.350113, lng: -0.317670 }  // Wanyama Village
+};
+
+// Default "visible" set: the 5 roller coasters.
+var CHESSINGTON_DEFAULT_VISIBLE = [11814, 83, 65, 74, 16457];
+
+var CHESSINGTON_ROSTER = [
+  { land: 'Adventure Point', rides: [
+      { id: 4574, name: 'Adventure Tree Carousel', infoUrl: 'https://coasterpedia.net/wiki/Adventure_Tree' },
+      { id: 67, name: "Elmer's Flying Jumbos", infoUrl: 'https://coasterpedia.net/wiki/Elmer%27s_Flying_Jumbos' },
+      { id: 80, name: 'Tiny Truckers', infoUrl: 'https://coasterpedia.net/wiki/Tiny_Truckers' }
+  ]},
+  { land: 'Forbidden Kingdom', rides: [
+      { id: 8691, name: 'Croc Drop', infoUrl: 'https://coasterpedia.net/wiki/Croc_Drop' },
+      { id: 85, name: 'Tomb Blaster', infoUrl: 'https://coasterpedia.net/wiki/Tomb_Blaster' }
+  ]},
+  { land: 'Land of the Dragons', rides: [
+      { id: 62, name: 'Canopy Capers' },
+      { id: 65, name: "Dragon's Fury", infoUrl: 'https://coasterpedia.net/wiki/Dragon%27s_Fury' },
+      { id: 66, name: "Dragon's Playhouse - Soft Play" },
+      { id: 87, name: "Griffin's Galleon", infoUrl: 'https://coasterpedia.net/wiki/Griffin%27s_Galleon' },
+      { id: 77, name: 'Sea Dragons', infoUrl: 'https://coasterpedia.net/wiki/Sea_Dragons_(Chessington_World_of_Adventures)' }
+  ]},
+  { land: 'Land of the Tiger', rides: [
+      { id: 64, name: 'Tiger Rock', infoUrl: 'https://coasterpedia.net/wiki/Tiger_Rock' }
+  ]},
+  { land: 'Mexicana', rides: [
+      { id: 74, name: 'Rattlesnake', infoUrl: 'https://coasterpedia.net/wiki/Rattlesnake_(Chessington_World_of_Adventures)' }
+  ]},
+  { land: 'Shipwreck Coast', rides: [
+      { id: 10889, name: 'Barrel Bail Out!', infoUrl: 'https://coasterpedia.net/wiki/Barrel_Bail_Out' },
+      { id: 60, name: 'Blue Barnacle', infoUrl: 'https://coasterpedia.net/wiki/Blue_Barnacle' },
+      { id: 78, name: 'Seastorm', infoUrl: 'https://coasterpedia.net/wiki/Seastorm_(Chessington_World_of_Adventures)' },
+      { id: 10890, name: 'Trawler Trouble', infoUrl: 'https://coasterpedia.net/wiki/Trawler_Trouble' }
+  ]},
+  { land: 'The Rainforest', rides: [
+      { id: 7336, name: 'Jungle Rangers', infoUrl: 'https://coasterpedia.net/wiki/Jungle_Rangers_(Chessington_World_of_Adventures)' },
+      { id: 7976, name: 'River Rafts', infoUrl: 'https://coasterpedia.net/wiki/River_Rafts_(Chessington_World_of_Adventures)' },
+      { id: 69, name: 'Treetop Hoppers', infoUrl: 'https://coasterpedia.net/wiki/Treetop_Hoppers' }
+  ]},
+  { land: 'Wanyama', rides: [
+      { id: 84, name: 'ZUFARI', infoUrl: 'https://coasterpedia.net/wiki/ZUFARI:_Ride_into_Africa' },
+      { id: 14467, name: 'Wanyama Village' }
+  ]},
+  { land: 'Wild Woods', rides: [
+      { id: 4535, name: 'The Gruffalo River Ride Adventure', infoUrl: 'https://coasterpedia.net/wiki/Gruffalo_River_Ride_Adventure' },
+      { id: 83, name: 'Vampire', infoUrl: 'https://coasterpedia.net/wiki/Vampire_(Chessington_World_of_Adventures)' }
+  ]},
+  { land: 'World of Jumanji', rides: [
+      { id: 11862, name: 'Mamba Strike', infoUrl: 'https://coasterpedia.net/wiki/Mamba_Strike' },
+      { id: 11814, name: 'Mandrill Mayhem', infoUrl: 'https://coasterpedia.net/wiki/Mandrill_Mayhem' },
+      { id: 11861, name: 'Ostrich Stampede', infoUrl: 'https://coasterpedia.net/wiki/Ostrich_Stampede' }
+  ]},
+  { land: 'World of PAW Patrol', rides: [
+      { id: 16457, name: "Chase's Mountain Mission", infoUrl: 'https://coasterpedia.net/wiki/Chase%27s_Mountain_Mission' },
+      { id: 16459, name: "Marshall's Firetruck Rescue", infoUrl: 'https://coasterpedia.net/wiki/Marshall%27s_Firetruck_Rescue' },
+      { id: 16466, name: "Rubble & Rocky's Play Zone" },
+      { id: 16458, name: "Skye's Helicopter Heroes", infoUrl: 'https://coasterpedia.net/wiki/Skye%27s_Helicopter_Heroes' },
+      { id: 16460, name: "Zuma's Hovercraft Adventure", infoUrl: 'https://coasterpedia.net/wiki/Zuma%27s_Hovercraft_Adventure' }
+  ]},
+  { land: 'Zoo', rides: [
+      { id: 59, name: 'AMAZU: Treetop Adventure' },
+      { id: 6381, name: 'Room on the Broom - A Magical Journey', infoUrl: 'https://coasterpedia.net/wiki/Room_on_the_Broom_-_A_Magical_Journey' }
+  ]}
+];
+
 // timezone: the park's IANA zone, from queue-times.com/parks.json (used to
 // work out the park's own "today" for the schedule lookup below).
 // themeParksId: the destination's UUID on themeparks.wiki, from
@@ -304,7 +406,10 @@ var PARKS = {
          timezone: 'Europe/Warsaw', themeParksId: 'd13baede-ab6d-419e-930a-ce7029a092e5' },
   2:   { name: 'Thorpe Park', roster: THORPE_ROSTER,
          coords: THORPE_COORDS, defaultVisible: THORPE_DEFAULT_VISIBLE,
-         timezone: 'Europe/London', themeParksId: 'b08d9272-d070-4580-9fcd-375270b191a7' }
+         timezone: 'Europe/London', themeParksId: 'b08d9272-d070-4580-9fcd-375270b191a7' },
+  3:   { name: 'Chessington World of Adventures', roster: CHESSINGTON_ROSTER,
+         coords: CHESSINGTON_COORDS, defaultVisible: CHESSINGTON_DEFAULT_VISIBLE,
+         timezone: 'Europe/London', themeParksId: 'ae959d1f-9fcc-4aab-8063-71e641fa57f4' }
 };
 
 function getSelectedParkId() {
@@ -969,8 +1074,8 @@ function handleRideLogStart(dict) {
   var durationSec = getMsgValue(dict, 'RideLogDuration') || 0;
   var maxGVal = getMsgValue(dict, 'RideLogMaxG');
   var minGVal = getMsgValue(dict, 'RideLogMinG');
-  var maxG = (maxGVal !== undefined ? maxGVal : 1000) / 1000.0;
-  var minG = (minGVal !== undefined ? minGVal : 1000) / 1000.0;
+  var maxG = (maxGVal !== undefined ? maxGVal : 0) / 1000.0;
+  var minG = (minGVal !== undefined ? minGVal : 0) / 1000.0;
   var avgGVal = getMsgValue(dict, 'RideLogAvgG');
   var avgG = (avgGVal !== undefined ? avgGVal : 0) / 1000.0;
   var airtimeMs = getMsgValue(dict, 'RideLogAirtimeMs') || 0;
@@ -1261,11 +1366,238 @@ function uploadRideToGitHub(session, callback) {
   });
 }
 
-function handleRideLogEnd() {
+function recomputeSummaryFromSamples(session) {
+  if (!session || !session.samples || session.samples.length === 0) return;
+  var sm = session.summary || {};
+  var samples = session.samples;
+  var count = samples.length;
+
+  var maxG = 0;
+  var minG = Infinity;
+  var sumG = 0;
+
+  var airtimeMs = 0;
+  var airtimeRunMs = 0;
+  var maxAirtimeMs = 0;
+  var airtimeHills = 0;
+  var highGMs = 0;
+
+  var jerkSum = 0;
+  var jerkCount = 0;
+
+  var rotationTenths = 0;
+  var turnAccumTenths = 0;
+  var turns = 0;
+  var prevHeading = null;
+  var prevFilteredG = null;
+
+  var intervalMs = session.sampleIntervalMs || 40;
+
+  for (var i = 0; i < count; i++) {
+    var s = samples[i];
+    var tMs = s[0];
+    var g = s[4]; // in G units
+    var heading = s[5]; // in degrees
+
+    var gMg = Math.round(g * 1000);
+    if (g > maxG) maxG = g;
+    if (g < minG) minG = g;
+    sumG += g;
+
+    var dtMs = intervalMs;
+    if (i > 0) {
+      var dTime = tMs - samples[i - 1][0];
+      if (dTime >= 4 && dTime <= 200) dtMs = dTime;
+    }
+
+    if (prevFilteredG !== null && dtMs > 0) {
+      var dG = Math.abs(gMg - prevFilteredG);
+      jerkSum += Math.round((dG * 1000) / dtMs);
+      jerkCount++;
+    }
+    prevFilteredG = gMg;
+
+    if (gMg >= 2000) {
+      highGMs += dtMs;
+    }
+
+    // Airtime: < 0.50G (500mg)
+    if (gMg < 500) {
+      var was = airtimeRunMs;
+      airtimeRunMs += dtMs;
+      if (was < 160 && airtimeRunMs >= 160) {
+        airtimeHills++;
+        airtimeMs += airtimeRunMs;
+      } else if (was >= 160) {
+        airtimeMs += dtMs;
+      }
+      if (airtimeRunMs > maxAirtimeMs) {
+        maxAirtimeMs = airtimeRunMs;
+      }
+    } else {
+      airtimeRunMs = 0;
+    }
+
+    // Heading and turns
+    if (typeof heading === 'number' && !isNaN(heading)) {
+      var headingTenths = Math.round(heading * 10);
+      if (prevHeading !== null) {
+        var dH = headingTenths - prevHeading;
+        if (dH > 1800) dH -= 3600;
+        else if (dH < -1800) dH += 3600;
+
+        if (dH !== 0) {
+          var absDh = Math.abs(dH);
+          rotationTenths += absDh;
+
+          var reversing = (turnAccumTenths > 0 && dH < 0) || (turnAccumTenths < 0 && dH > 0);
+          if (reversing && absDh >= 300) {
+            if (Math.abs(turnAccumTenths) >= 900) {
+              turns++;
+            }
+            turnAccumTenths = dH;
+          } else {
+            turnAccumTenths += dH;
+          }
+        }
+      }
+      prevHeading = headingTenths;
+    }
+  }
+
+  if (Math.abs(turnAccumTenths) >= 900) {
+    turns++;
+  }
+
+  if (minG === Infinity) minG = 0;
+  var avgG = count > 0 ? (sumG / count) : 0;
+  var roughness = jerkCount > 0 ? Math.round(jerkSum / jerkCount) : 0;
+
+  var durSec = 0;
+  if (count > 1) {
+    durSec = Math.round((samples[count - 1][0] - samples[0][0]) / 1000);
+  } else if (count === 1) {
+    durSec = 1;
+  }
+
+  if (!session.durationSec || session.durationSec <= 0) {
+    session.durationSec = durSec;
+  }
+
+  // Populate/recompute metrics if missing, zero, or default sentinels
+  if (!sm.maxG || sm.maxG <= 0 || (maxG > sm.maxG && sm.maxG <= 1.01)) {
+    sm.maxG = Math.round(maxG * 100) / 100;
+  }
+  if (sm.minG === undefined || sm.minG === null || sm.minG === 0 || (minG < sm.minG && sm.minG >= 0.99)) {
+    sm.minG = Math.round(minG * 100) / 100;
+  }
+  if (!sm.avgG || sm.avgG <= 0) {
+    sm.avgG = Math.round(avgG * 100) / 100;
+  }
+  if (!sm.airtimeSec && airtimeMs > 0) {
+    sm.airtimeSec = Math.round((airtimeMs / 1000.0) * 10) / 10;
+  }
+  if (!sm.airtimeHills && airtimeHills > 0) {
+    sm.airtimeHills = airtimeHills;
+  }
+  if (!sm.maxAirtimeSec && maxAirtimeMs > 0) {
+    sm.maxAirtimeSec = Math.round((maxAirtimeMs / 1000.0) * 10) / 10;
+  }
+  if (!sm.highGSec && highGMs > 0) {
+    sm.highGSec = Math.round((highGMs / 1000.0) * 10) / 10;
+  }
+  if (!sm.turns && turns > 0) {
+    sm.turns = turns;
+  }
+  if (!sm.rotationDeg && rotationTenths > 0) {
+    sm.rotationDeg = Math.round(rotationTenths / 10);
+  }
+  if (!sm.roughness && roughness > 0) {
+    sm.roughness = roughness;
+  }
+  if (!sm.totalSamples || sm.totalSamples <= 0) {
+    sm.totalSamples = count;
+  }
+
+  session.summary = sm;
+}
+
+function handleRideLogEnd(dict) {
   if (!s_active_ride_session) {
     handleRideLogStart({});
   }
   if (!s_active_ride_session) return;
+
+  if (dict) {
+    var endRideId = getMsgValue(dict, 'RideLogRideId');
+    if (endRideId !== undefined && (s_active_ride_session.rideId === undefined || s_active_ride_session.rideId === 0)) {
+      s_active_ride_session.rideId = endRideId;
+    }
+    var endRideName = getMsgValue(dict, 'RideLogRideName');
+    if (endRideName && (!s_active_ride_session.rideName || s_active_ride_session.rideName === 'Coaster')) {
+      s_active_ride_session.rideName = endRideName;
+    }
+    var endDur = getMsgValue(dict, 'RideLogDuration');
+    if (endDur && (!s_active_ride_session.durationSec || s_active_ride_session.durationSec <= 0)) {
+      s_active_ride_session.durationSec = endDur;
+    }
+    var endMaxG = getMsgValue(dict, 'RideLogMaxG');
+    if (endMaxG !== undefined && endMaxG > 0 && (!s_active_ride_session.summary.maxG || s_active_ride_session.summary.maxG <= 1.0)) {
+      s_active_ride_session.summary.maxG = endMaxG / 1000.0;
+    }
+    var endMinG = getMsgValue(dict, 'RideLogMinG');
+    if (endMinG !== undefined && endMinG !== 0 && (!s_active_ride_session.summary.minG || s_active_ride_session.summary.minG === 0 || s_active_ride_session.summary.minG === 1.0)) {
+      s_active_ride_session.summary.minG = endMinG / 1000.0;
+    }
+    var endAvgG = getMsgValue(dict, 'RideLogAvgG');
+    if (endAvgG !== undefined && endAvgG > 0 && !s_active_ride_session.summary.avgG) {
+      s_active_ride_session.summary.avgG = endAvgG / 1000.0;
+    }
+    var endAirMs = getMsgValue(dict, 'RideLogAirtimeMs');
+    if (endAirMs !== undefined && !s_active_ride_session.summary.airtimeSec) {
+      s_active_ride_session.summary.airtimeSec = Math.round((endAirMs / 1000.0) * 10) / 10;
+    }
+    var endAirHills = getMsgValue(dict, 'RideLogAirtimeHills');
+    if (endAirHills !== undefined && !s_active_ride_session.summary.airtimeHills) {
+      s_active_ride_session.summary.airtimeHills = endAirHills;
+    }
+    var endMaxAirMs = getMsgValue(dict, 'RideLogMaxAirtimeMs');
+    if (endMaxAirMs !== undefined && !s_active_ride_session.summary.maxAirtimeSec) {
+      s_active_ride_session.summary.maxAirtimeSec = Math.round((endMaxAirMs / 1000.0) * 10) / 10;
+    }
+    var endHighGMs = getMsgValue(dict, 'RideLogHighGMs');
+    if (endHighGMs !== undefined && !s_active_ride_session.summary.highGSec) {
+      s_active_ride_session.summary.highGSec = Math.round((endHighGMs / 1000.0) * 10) / 10;
+    }
+    var endTurns = getMsgValue(dict, 'RideLogTurns');
+    if (endTurns !== undefined && !s_active_ride_session.summary.turns) {
+      s_active_ride_session.summary.turns = endTurns;
+    }
+    var endRot = getMsgValue(dict, 'RideLogRotationDeg');
+    if (endRot !== undefined && !s_active_ride_session.summary.rotationDeg) {
+      s_active_ride_session.summary.rotationDeg = endRot;
+    }
+    var endRough = getMsgValue(dict, 'RideLogRoughness');
+    if (endRough !== undefined && !s_active_ride_session.summary.roughness) {
+      s_active_ride_session.summary.roughness = endRough;
+    }
+    var endTrunc = getMsgValue(dict, 'RideLogTruncated');
+    if (endTrunc !== undefined) {
+      s_active_ride_session.truncated = !!endTrunc;
+    }
+    var endClipped = getMsgValue(dict, 'RideLogClipped');
+    if (endClipped !== undefined && !s_active_ride_session.clippedSamples) {
+      s_active_ride_session.clippedSamples = endClipped;
+    }
+    var endTotal = getMsgValue(dict, 'RideLogTotalSamples');
+    if (endTotal !== undefined && !s_active_ride_session.summary.totalSamples) {
+      s_active_ride_session.summary.totalSamples = endTotal;
+    }
+  }
+
+  // Always recompute/fill from samples if any metrics were zero or missing
+  recomputeSummaryFromSamples(s_active_ride_session);
+
   persistRideLogs(s_active_ride_session);
   console.log('CoasterWatch: Saved complete ride log for ' + s_active_ride_session.rideName +
               ' with ' + s_active_ride_session.samples.length + ' raw samples.');
@@ -1968,6 +2300,22 @@ var RIDE_LOGS_COMPONENT = {
 
       rideList.forEach(function (ride) {
         var sm = ride.summary || {};
+        if ((!sm.maxG || sm.maxG <= 0 || (sm.maxG === 1.0 && sm.minG === 1.0)) && ride.samples && ride.samples.length > 0) {
+          var pMax = 0, pMin = Infinity, pSum = 0;
+          for (var si = 0; si < ride.samples.length; si++) {
+            var sg = ride.samples[si][4];
+            if (sg > pMax) pMax = sg;
+            if (sg < pMin) pMin = sg;
+            pSum += sg;
+          }
+          if (pMin === Infinity) pMin = 0;
+          sm.maxG = Math.round(pMax * 100) / 100;
+          sm.minG = Math.round(pMin * 100) / 100;
+          sm.avgG = Math.round((pSum / ride.samples.length) * 100) / 100;
+          if ((!ride.durationSec || ride.durationSec <= 0) && ride.samples.length > 1) {
+            ride.durationSec = Math.round((ride.samples[ride.samples.length - 1][0] - ride.samples[0][0]) / 1000);
+          }
+        }
         var card = document.createElement('div');
         card.className = 'rl-card';
         card.setAttribute('data-ride-id', ride.id || '');

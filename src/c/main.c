@@ -38,7 +38,13 @@
 // the graph only shows samples recorded while this app has been running
 // today.
 
+#if defined(PBL_PLATFORM_APLITE)
+// Aplite has only 24KB of app RAM shared between code, data, and bss.
+// Sizing MAX_RIDES to 20 saves 880 bytes from .bss, fitting cleanly within APP region.
+#define MAX_RIDES         20
+#else
 #define MAX_RIDES         40
+#endif
 #define MAX_GRAPH_POINTS  24
 // Minutes between two consecutive graph points beyond which the connecting
 // line is skipped (see detail_graph_update_proc) - well above the normal
@@ -103,7 +109,11 @@
 // than that just burns battery/network for no fresher data.
 #define REFRESH_INTERVAL_MS (5 * 60 * 1000)
 
+#if defined(PBL_PLATFORM_APLITE)
+#define MAX_ALERTS            10
+#else
 #define MAX_ALERTS            20
+#endif
 #define ALERT_STEP_MINUTES     5
 #define ALERT_MAX_MINUTES    120
 #define ALERT_DEFAULT_MINUTES 15
@@ -2124,6 +2134,29 @@ static RawSensorSample *s_tracker_raw_samples = NULL;
 static uint16_t s_tracker_sample_count = 0;
 static uint16_t s_tracker_allocated_capacity = 0;
 
+typedef struct {
+  int32_t ride_id;
+  char ride_name[NAME_BUF_LEN];
+  uint16_t duration_sec;
+  int16_t max_g;
+  int16_t min_g;
+  int16_t avg_g;
+  uint32_t airtime_ms;
+  uint16_t airtime_hills;
+  uint32_t max_airtime_ms;
+  uint32_t high_g_ms;
+  uint16_t turns;
+  uint16_t rotation_deg;
+  uint16_t roughness;
+  uint16_t sample_interval_tenths;
+  bool truncated;
+  uint16_t clipped_samples;
+  uint16_t total_samples;
+} TrackerSavedSummary;
+
+static TrackerSavedSummary s_tracker_saved_summary;
+static uint8_t s_tracker_last_sent_chunk_count = 0;
+
 static uint16_t s_tracker_current_heading = 0;
 static bool s_tracker_compass_ok = false;
 static TrackerSyncState s_tracker_sync_state = TRACKER_SYNC_IDLE;
@@ -2469,82 +2502,114 @@ static void tracker_sync_start_timer_callback(void *data) {
 }
 
 static void start_tracker_sync_to_phone(void) {
-  if (s_tracker_sample_count == 0 || !s_tracker_raw_samples) return;
+  if (s_tracker_saved_summary.total_samples == 0 || !s_tracker_raw_samples) return;
   s_tracker_sync_state = TRACKER_SYNC_SENDING_START;
   s_tracker_sync_offset = 0;
+  s_tracker_last_sent_chunk_count = 0;
   if (s_tracker_header_layer) layer_mark_dirty(s_tracker_header_layer);
 
-  uint32_t retry_ms = s_phone_connected ? 150 : 2000;
+  if (!s_phone_connected) {
+    // Phone disconnected (e.g. in lockers) — do not flood the outbox;
+    // connection_handler will launch the sync as soon as Bluetooth reconnects.
+    return;
+  }
+
+  uint32_t retry_ms = 150;
 
   DictionaryIterator *iter;
   AppMessageResult res = app_message_outbox_begin(&iter);
   if (res == APP_MSG_OK) {
     dict_write_uint8(iter, MESSAGE_KEY_RideLogStart, 1);
-    dict_write_int32(iter, MESSAGE_KEY_RideLogRideId, s_tracker_ride_id);
-    dict_write_cstring(iter, MESSAGE_KEY_RideLogRideName, s_tracker_ride_name);
-    dict_write_uint16(iter, MESSAGE_KEY_RideLogDuration, s_tracker_elapsed_sec);
-    // Both extrema are |a| — a vector magnitude, so never negative. Sent as
-    // int16 for wire compatibility, but a "min G" below zero is not a thing
-    // this hardware can produce; see the note by tracker_summary_min_g().
-    dict_write_int16(iter, MESSAGE_KEY_RideLogMaxG, tracker_summary_max_g());
-    dict_write_int16(iter, MESSAGE_KEY_RideLogMinG, tracker_summary_min_g());
-    dict_write_int16(iter, MESSAGE_KEY_RideLogAvgG, tracker_summary_avg_g());
-    dict_write_uint32(iter, MESSAGE_KEY_RideLogAirtimeMs, s_tracker_airtime_ms);
-    dict_write_uint16(iter, MESSAGE_KEY_RideLogAirtimeHills, s_tracker_airtime_hills);
-    dict_write_uint32(iter, MESSAGE_KEY_RideLogMaxAirtimeMs, s_tracker_max_airtime_ms);
-    dict_write_uint32(iter, MESSAGE_KEY_RideLogHighGMs, s_tracker_high_g_ms);
-    dict_write_uint16(iter, MESSAGE_KEY_RideLogTurns, s_tracker_turn_count);
-    dict_write_uint16(iter, MESSAGE_KEY_RideLogRotationDeg,
-                      (uint16_t)(s_tracker_rotation_tenths / 10));
-    dict_write_uint16(iter, MESSAGE_KEY_RideLogRoughness, tracker_summary_roughness());
-    dict_write_uint16(iter, MESSAGE_KEY_RideLogSampleIntervalMs, tracker_summary_interval_tenths());
-    dict_write_uint8(iter, MESSAGE_KEY_RideLogTruncated, s_tracker_buffer_full ? 1 : 0);
-    dict_write_uint16(iter, MESSAGE_KEY_RideLogClipped,
-                      s_tracker_clipped_samples > UINT16_MAX
-                          ? UINT16_MAX : (uint16_t)s_tracker_clipped_samples);
-    dict_write_uint16(iter, MESSAGE_KEY_RideLogTotalSamples, s_tracker_sample_count);
+    dict_write_int32(iter, MESSAGE_KEY_RideLogRideId, s_tracker_saved_summary.ride_id);
+    dict_write_cstring(iter, MESSAGE_KEY_RideLogRideName, s_tracker_saved_summary.ride_name);
+    dict_write_uint16(iter, MESSAGE_KEY_RideLogDuration, s_tracker_saved_summary.duration_sec);
+    dict_write_int16(iter, MESSAGE_KEY_RideLogMaxG, s_tracker_saved_summary.max_g);
+    dict_write_int16(iter, MESSAGE_KEY_RideLogMinG, s_tracker_saved_summary.min_g);
+    dict_write_int16(iter, MESSAGE_KEY_RideLogAvgG, s_tracker_saved_summary.avg_g);
+    dict_write_uint32(iter, MESSAGE_KEY_RideLogAirtimeMs, s_tracker_saved_summary.airtime_ms);
+    dict_write_uint16(iter, MESSAGE_KEY_RideLogAirtimeHills, s_tracker_saved_summary.airtime_hills);
+    dict_write_uint32(iter, MESSAGE_KEY_RideLogMaxAirtimeMs, s_tracker_saved_summary.max_airtime_ms);
+    dict_write_uint32(iter, MESSAGE_KEY_RideLogHighGMs, s_tracker_saved_summary.high_g_ms);
+    dict_write_uint16(iter, MESSAGE_KEY_RideLogTurns, s_tracker_saved_summary.turns);
+    dict_write_uint16(iter, MESSAGE_KEY_RideLogRotationDeg, s_tracker_saved_summary.rotation_deg);
+    dict_write_uint16(iter, MESSAGE_KEY_RideLogRoughness, s_tracker_saved_summary.roughness);
+    dict_write_uint16(iter, MESSAGE_KEY_RideLogSampleIntervalMs, s_tracker_saved_summary.sample_interval_tenths);
+    dict_write_uint8(iter, MESSAGE_KEY_RideLogTruncated, s_tracker_saved_summary.truncated ? 1 : 0);
+    dict_write_uint16(iter, MESSAGE_KEY_RideLogClipped, s_tracker_saved_summary.clipped_samples);
+    dict_write_uint16(iter, MESSAGE_KEY_RideLogTotalSamples, s_tracker_saved_summary.total_samples);
     AppMessageResult send_res = app_message_outbox_send();
     if (send_res != APP_MSG_OK) {
       if (s_tracker_sync_timer) app_timer_cancel(s_tracker_sync_timer);
-      s_tracker_sync_timer = app_timer_register(retry_ms, tracker_sync_start_timer_callback, NULL);
+      if (s_phone_connected) {
+        s_tracker_sync_timer = app_timer_register(retry_ms, tracker_sync_start_timer_callback, NULL);
+      }
     }
   } else {
     if (s_tracker_sync_timer) app_timer_cancel(s_tracker_sync_timer);
-    s_tracker_sync_timer = app_timer_register(retry_ms, tracker_sync_start_timer_callback, NULL);
+    if (s_phone_connected) {
+      s_tracker_sync_timer = app_timer_register(retry_ms, tracker_sync_start_timer_callback, NULL);
+    }
   }
 }
 
 static void send_next_tracker_chunk(void *data) {
   s_tracker_sync_timer = NULL;
   if (s_tracker_sync_state != TRACKER_SYNC_SENDING_CHUNKS && s_tracker_sync_state != TRACKER_SYNC_SENDING_END) return;
-  if (!s_tracker_raw_samples || s_tracker_sample_count == 0) {
+  if (!s_tracker_raw_samples || s_tracker_saved_summary.total_samples == 0) {
     s_tracker_sync_state = TRACKER_SYNC_DONE;
     if (s_tracker_header_layer) layer_mark_dirty(s_tracker_header_layer);
     return;
   }
 
-  uint32_t retry_ms = s_phone_connected ? 150 : 2000;
+  if (!s_phone_connected) {
+    // Phone disconnected — pause chunk sending until reconnection
+    return;
+  }
 
-  if (s_tracker_sync_offset >= s_tracker_sample_count) {
+  uint32_t retry_ms = 150;
+
+  if (s_tracker_sync_offset >= s_tracker_saved_summary.total_samples) {
     s_tracker_sync_state = TRACKER_SYNC_SENDING_END;
     DictionaryIterator *iter;
     AppMessageResult res = app_message_outbox_begin(&iter);
     if (res == APP_MSG_OK) {
       dict_write_uint8(iter, MESSAGE_KEY_RideLogEnd, 1);
-      dict_write_uint16(iter, MESSAGE_KEY_RideLogTotalSamples, s_tracker_sample_count);
+      dict_write_uint16(iter, MESSAGE_KEY_RideLogTotalSamples, s_tracker_saved_summary.total_samples);
+      // Redundantly deliver the summary stats in RideLogEnd in case RideLogStart was missed!
+      dict_write_int32(iter, MESSAGE_KEY_RideLogRideId, s_tracker_saved_summary.ride_id);
+      dict_write_cstring(iter, MESSAGE_KEY_RideLogRideName, s_tracker_saved_summary.ride_name);
+      dict_write_uint16(iter, MESSAGE_KEY_RideLogDuration, s_tracker_saved_summary.duration_sec);
+      dict_write_int16(iter, MESSAGE_KEY_RideLogMaxG, s_tracker_saved_summary.max_g);
+      dict_write_int16(iter, MESSAGE_KEY_RideLogMinG, s_tracker_saved_summary.min_g);
+      dict_write_int16(iter, MESSAGE_KEY_RideLogAvgG, s_tracker_saved_summary.avg_g);
+      dict_write_uint32(iter, MESSAGE_KEY_RideLogAirtimeMs, s_tracker_saved_summary.airtime_ms);
+      dict_write_uint16(iter, MESSAGE_KEY_RideLogAirtimeHills, s_tracker_saved_summary.airtime_hills);
+      dict_write_uint32(iter, MESSAGE_KEY_RideLogMaxAirtimeMs, s_tracker_saved_summary.max_airtime_ms);
+      dict_write_uint32(iter, MESSAGE_KEY_RideLogHighGMs, s_tracker_saved_summary.high_g_ms);
+      dict_write_uint16(iter, MESSAGE_KEY_RideLogTurns, s_tracker_saved_summary.turns);
+      dict_write_uint16(iter, MESSAGE_KEY_RideLogRotationDeg, s_tracker_saved_summary.rotation_deg);
+      dict_write_uint16(iter, MESSAGE_KEY_RideLogRoughness, s_tracker_saved_summary.roughness);
+      dict_write_uint16(iter, MESSAGE_KEY_RideLogSampleIntervalMs, s_tracker_saved_summary.sample_interval_tenths);
+      dict_write_uint8(iter, MESSAGE_KEY_RideLogTruncated, s_tracker_saved_summary.truncated ? 1 : 0);
+      dict_write_uint16(iter, MESSAGE_KEY_RideLogClipped, s_tracker_saved_summary.clipped_samples);
+
       AppMessageResult send_res = app_message_outbox_send();
       if (send_res != APP_MSG_OK) {
         if (s_tracker_sync_timer) app_timer_cancel(s_tracker_sync_timer);
-        s_tracker_sync_timer = app_timer_register(retry_ms, tracker_chunk_timer_callback, NULL);
+        if (s_phone_connected) {
+          s_tracker_sync_timer = app_timer_register(retry_ms, tracker_chunk_timer_callback, NULL);
+        }
       }
     } else {
       if (s_tracker_sync_timer) app_timer_cancel(s_tracker_sync_timer);
-      s_tracker_sync_timer = app_timer_register(retry_ms, tracker_chunk_timer_callback, NULL);
+      if (s_phone_connected) {
+        s_tracker_sync_timer = app_timer_register(retry_ms, tracker_chunk_timer_callback, NULL);
+      }
     }
     return;
   }
 
-  uint16_t remaining = s_tracker_sample_count - s_tracker_sync_offset;
+  uint16_t remaining = s_tracker_saved_summary.total_samples - s_tracker_sync_offset;
   uint8_t count = remaining > SAMPLES_PER_CHUNK ? SAMPLES_PER_CHUNK : (uint8_t)remaining;
 
   uint8_t chunk_buf[3 + (SAMPLES_PER_CHUNK * 8)];
@@ -2569,16 +2634,21 @@ static void send_next_tracker_chunk(void *data) {
   AppMessageResult res = app_message_outbox_begin(&iter);
   if (res == APP_MSG_OK) {
     dict_write_data(iter, MESSAGE_KEY_RideLogChunk, chunk_buf, byte_idx);
+    s_tracker_last_sent_chunk_count = count;
     AppMessageResult send_res = app_message_outbox_send();
-    if (send_res == APP_MSG_OK) {
-      s_tracker_sync_offset += count;
-    } else {
+    if (send_res != APP_MSG_OK) {
+      s_tracker_last_sent_chunk_count = 0;
       if (s_tracker_sync_timer) app_timer_cancel(s_tracker_sync_timer);
-      s_tracker_sync_timer = app_timer_register(retry_ms, tracker_chunk_timer_callback, NULL);
+      if (s_phone_connected) {
+        s_tracker_sync_timer = app_timer_register(retry_ms, tracker_chunk_timer_callback, NULL);
+      }
     }
   } else {
+    s_tracker_last_sent_chunk_count = 0;
     if (s_tracker_sync_timer) app_timer_cancel(s_tracker_sync_timer);
-    s_tracker_sync_timer = app_timer_register(retry_ms, tracker_chunk_timer_callback, NULL);
+    if (s_phone_connected) {
+      s_tracker_sync_timer = app_timer_register(retry_ms, tracker_chunk_timer_callback, NULL);
+    }
   }
 }
 
@@ -2609,6 +2679,7 @@ static void begin_tracker_recording(void) {
       }
     }
   }
+  memset(&s_tracker_saved_summary, 0, sizeof(s_tracker_saved_summary));
   s_tracker_sample_count = 0;
   s_tracker_buffer_full = false;
   s_tracker_live_g = 1000;
@@ -2710,6 +2781,51 @@ static void stop_tracker_recording(void) {
 
   s_tracker_state = TRACKER_STATE_SUMMARY;
   tracker_bank_turn();
+
+  // Resilience fallback: if metric samples were zero (e.g. sustained vibration
+  // blanking from disconnect alerts), reconstruct the G-force metrics directly
+  // from the stored raw samples so summary stats are never blanked to 0!
+  if (s_tracker_metric_samples == 0 && s_tracker_sample_count > 0 && s_tracker_raw_samples) {
+    int16_t fb_max = 0;
+    int16_t fb_min = INT16_MAX;
+    uint32_t fb_sum = 0;
+    for (uint16_t i = 0; i < s_tracker_sample_count; i++) {
+      int32_t sx = s_tracker_raw_samples[i].x;
+      int32_t sy = s_tracker_raw_samples[i].y;
+      int32_t sz = s_tracker_raw_samples[i].z;
+      int16_t g = (int16_t)int_sqrt(sx * sx + sy * sy + sz * sz);
+      if (g > fb_max) fb_max = g;
+      if (g < fb_min) fb_min = g;
+      fb_sum += g;
+    }
+    s_tracker_max_g = fb_max;
+    s_tracker_min_g = fb_min;
+    s_tracker_g_sum = fb_sum;
+    s_tracker_metric_samples = s_tracker_sample_count;
+  }
+
+  // Snapshot the complete summary so closing the window or navigating the UI
+  // never overwrites or resets the data waiting to sync.
+  s_tracker_saved_summary.ride_id = s_tracker_ride_id;
+  strncpy(s_tracker_saved_summary.ride_name, s_tracker_ride_name, NAME_BUF_LEN - 1);
+  s_tracker_saved_summary.ride_name[NAME_BUF_LEN - 1] = '\0';
+  s_tracker_saved_summary.duration_sec = s_tracker_elapsed_sec;
+  s_tracker_saved_summary.max_g = tracker_summary_max_g();
+  s_tracker_saved_summary.min_g = tracker_summary_min_g();
+  s_tracker_saved_summary.avg_g = tracker_summary_avg_g();
+  s_tracker_saved_summary.airtime_ms = s_tracker_airtime_ms;
+  s_tracker_saved_summary.airtime_hills = s_tracker_airtime_hills;
+  s_tracker_saved_summary.max_airtime_ms = s_tracker_max_airtime_ms;
+  s_tracker_saved_summary.high_g_ms = s_tracker_high_g_ms;
+  s_tracker_saved_summary.turns = s_tracker_turn_count;
+  s_tracker_saved_summary.rotation_deg = (uint16_t)(s_tracker_rotation_tenths / 10);
+  s_tracker_saved_summary.roughness = tracker_summary_roughness();
+  s_tracker_saved_summary.sample_interval_tenths = tracker_summary_interval_tenths();
+  s_tracker_saved_summary.truncated = s_tracker_buffer_full;
+  s_tracker_saved_summary.clipped_samples = (s_tracker_clipped_samples > UINT16_MAX)
+                                               ? UINT16_MAX : (uint16_t)s_tracker_clipped_samples;
+  s_tracker_saved_summary.total_samples = s_tracker_sample_count;
+
   APP_LOG(APP_LOG_LEVEL_INFO,
           "tracker: %u metric samples, %u blanked (vibe), %u clipped, %u stored",
           (unsigned)s_tracker_metric_samples, (unsigned)s_tracker_blanked_samples,
@@ -2765,8 +2881,11 @@ static void tracker_header_update_proc(Layer *layer, GContext *ctx) {
     int sec = s_tracker_elapsed_sec % 60;
     snprintf(right_buf, sizeof(right_buf), "%02d:%02d/5m", min, sec);
   } else if (s_tracker_state == TRACKER_STATE_SUMMARY) {
-    snprintf(left_buf, sizeof(left_buf), "%s", s_tracker_ride_name);
-    if (s_tracker_sync_state == TRACKER_SYNC_SENDING_START || s_tracker_sync_state == TRACKER_SYNC_SENDING_CHUNKS) {
+    const char *rname = s_tracker_saved_summary.ride_name[0] ? s_tracker_saved_summary.ride_name : s_tracker_ride_name;
+    snprintf(left_buf, sizeof(left_buf), "%s", rname);
+    if (!s_phone_connected) {
+      snprintf(right_buf, sizeof(right_buf), "Offline");
+    } else if (s_tracker_sync_state == TRACKER_SYNC_SENDING_START || s_tracker_sync_state == TRACKER_SYNC_SENDING_CHUNKS) {
       snprintf(right_buf, sizeof(right_buf), "Syncing...");
     } else if (s_tracker_sync_state == TRACKER_SYNC_DONE) {
       snprintf(right_buf, sizeof(right_buf), "Saved");
@@ -2908,17 +3027,26 @@ static void tracker_main_update_proc(Layer *layer, GContext *ctx) {
     graphics_context_set_fill_color(ctx, GColorWhite);
     graphics_fill_rect(ctx, bounds, 0, GCornerNone);
 
+    int16_t show_max = s_tracker_saved_summary.total_samples > 0 ? s_tracker_saved_summary.max_g : tracker_summary_max_g();
+    int16_t show_min = s_tracker_saved_summary.total_samples > 0 ? s_tracker_saved_summary.min_g : tracker_summary_min_g();
+    uint32_t show_air_ms = s_tracker_saved_summary.total_samples > 0 ? s_tracker_saved_summary.airtime_ms : s_tracker_airtime_ms;
+    uint32_t show_best_air_ms = s_tracker_saved_summary.total_samples > 0 ? s_tracker_saved_summary.max_airtime_ms : s_tracker_max_airtime_ms;
+    uint16_t show_hills = s_tracker_saved_summary.total_samples > 0 ? s_tracker_saved_summary.airtime_hills : s_tracker_airtime_hills;
+    uint16_t show_turns = s_tracker_saved_summary.total_samples > 0 ? s_tracker_saved_summary.turns : s_tracker_turn_count;
+    uint16_t show_dur = s_tracker_saved_summary.total_samples > 0 ? s_tracker_saved_summary.duration_sec : s_tracker_elapsed_sec;
+    bool show_trunc = s_tracker_saved_summary.total_samples > 0 ? s_tracker_saved_summary.truncated : s_tracker_buffer_full;
+
     char max_buf[16], min_buf[16];
-    format_g_force(max_buf, sizeof(max_buf), tracker_summary_max_g());
-    format_g_force(min_buf, sizeof(min_buf), tracker_summary_min_g());
+    format_g_force(max_buf, sizeof(max_buf), show_max);
+    format_g_force(min_buf, sizeof(min_buf), show_min);
 
-    int air_sec = s_tracker_airtime_ms / 1000;
-    int air_dec = (s_tracker_airtime_ms % 1000) / 100;
-    int best_air_sec = s_tracker_max_airtime_ms / 1000;
-    int best_air_dec = (s_tracker_max_airtime_ms % 1000) / 100;
+    int air_sec = show_air_ms / 1000;
+    int air_dec = (show_air_ms % 1000) / 100;
+    int best_air_sec = show_best_air_ms / 1000;
+    int best_air_dec = (show_best_air_ms % 1000) / 100;
 
-    int dur_min = s_tracker_elapsed_sec / 60;
-    int dur_sec = s_tracker_elapsed_sec % 60;
+    int dur_min = show_dur / 60;
+    int dur_sec = show_dur % 60;
 
     // The watch shows the headline numbers; avg G, roughness, high-G time and
     // total rotation all still go to the phone and into the exported CSV/JSON,
@@ -2926,13 +3054,13 @@ static void tracker_main_update_proc(Layer *layer, GContext *ctx) {
     char row1[48], row2[48], row3[48];
     snprintf(row1, sizeof(row1), "Max %s  Min %s", max_buf, min_buf);
     snprintf(row2, sizeof(row2), "Air %d.%ds (%d) best %d.%ds",
-             air_sec, air_dec, s_tracker_airtime_hills, best_air_sec, best_air_dec);
+             air_sec, air_dec, (int)show_hills, best_air_sec, best_air_dec);
     // "Turns", not "Inversions" — see the sensor note at the top of this
     // section. Truncation is called out because the summary covers the whole
     // ride while the exported telemetry stops at the buffer.
     snprintf(row3, sizeof(row3), "%d turns  %d:%02d%s",
-             s_tracker_turn_count, dur_min, dur_sec,
-             s_tracker_buffer_full ? " (part)" : "");
+             (int)show_turns, dur_min, dur_sec,
+             show_trunc ? " (part)" : "");
 
     graphics_context_set_text_color(ctx, GColorBlack);
     graphics_draw_text(ctx, row1, fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD),
@@ -3144,7 +3272,9 @@ static void tracker_window_unload(Window *window) {
 
   window_destroy(window);
   s_tracker_window = NULL;
-  s_tracker_ride_id = -1;
+  if (s_tracker_sync_state == TRACKER_SYNC_IDLE || s_tracker_sync_state == TRACKER_SYNC_DONE) {
+    s_tracker_ride_id = -1;
+  }
 }
 
 static void open_tracker_window(void) {
@@ -3451,17 +3581,57 @@ static void tracker_free_samples_if_unused(void) {
   s_tracker_allocated_capacity = 0;
   s_tracker_sample_count = 0;
   s_tracker_sync_state = TRACKER_SYNC_IDLE;
+  s_tracker_ride_id = -1;
 }
 
 static void outbox_sent_callback(DictionaryIterator *iter, void *context) {
+  if (iter) {
+    if (dict_find(iter, MESSAGE_KEY_RideLogStart)) {
+      if (s_tracker_sync_state == TRACKER_SYNC_SENDING_START) {
+        s_tracker_sync_state = TRACKER_SYNC_SENDING_CHUNKS;
+        s_tracker_sync_offset = 0;
+        s_tracker_last_sent_chunk_count = 0;
+        if (s_tracker_sync_timer) {
+          app_timer_cancel(s_tracker_sync_timer);
+          s_tracker_sync_timer = NULL;
+        }
+        s_tracker_sync_timer = app_timer_register(30, tracker_chunk_timer_callback, NULL);
+      }
+      return;
+    }
+    if (dict_find(iter, MESSAGE_KEY_RideLogChunk)) {
+      if (s_tracker_sync_state == TRACKER_SYNC_SENDING_CHUNKS) {
+        s_tracker_sync_offset += s_tracker_last_sent_chunk_count;
+        s_tracker_last_sent_chunk_count = 0;
+        if (s_tracker_sync_timer) {
+          app_timer_cancel(s_tracker_sync_timer);
+          s_tracker_sync_timer = NULL;
+        }
+        s_tracker_sync_timer = app_timer_register(30, tracker_chunk_timer_callback, NULL);
+      }
+      return;
+    }
+    if (dict_find(iter, MESSAGE_KEY_RideLogEnd)) {
+      s_tracker_sync_state = TRACKER_SYNC_DONE;
+      if (s_tracker_header_layer) layer_mark_dirty(s_tracker_header_layer);
+      tracker_free_samples_if_unused();
+      return;
+    }
+  }
+
+  // Fallback if iter is NULL
   if (s_tracker_sync_state == TRACKER_SYNC_SENDING_START) {
     s_tracker_sync_state = TRACKER_SYNC_SENDING_CHUNKS;
+    s_tracker_sync_offset = 0;
+    s_tracker_last_sent_chunk_count = 0;
     if (s_tracker_sync_timer) {
       app_timer_cancel(s_tracker_sync_timer);
       s_tracker_sync_timer = NULL;
     }
     s_tracker_sync_timer = app_timer_register(30, tracker_chunk_timer_callback, NULL);
   } else if (s_tracker_sync_state == TRACKER_SYNC_SENDING_CHUNKS) {
+    s_tracker_sync_offset += s_tracker_last_sent_chunk_count;
+    s_tracker_last_sent_chunk_count = 0;
     if (s_tracker_sync_timer) {
       app_timer_cancel(s_tracker_sync_timer);
       s_tracker_sync_timer = NULL;
@@ -3484,10 +3654,19 @@ static void outbox_failed_callback(DictionaryIterator *iter, AppMessageResult re
       app_timer_cancel(s_tracker_sync_timer);
       s_tracker_sync_timer = NULL;
     }
+    // Failed chunk was not confirmed: reset last sent count so offset is not advanced
+    s_tracker_last_sent_chunk_count = 0;
+
+    // If phone is disconnected (e.g. in lockers), do NOT hammer the radio with retries!
+    // connection_handler will resume the sync as soon as Bluetooth reconnects.
+    if (!s_phone_connected) {
+      return;
+    }
+
     if (s_tracker_sync_state == TRACKER_SYNC_SENDING_START) {
-      s_tracker_sync_timer = app_timer_register(250, tracker_sync_start_timer_callback, NULL);
+      s_tracker_sync_timer = app_timer_register(300, tracker_sync_start_timer_callback, NULL);
     } else {
-      s_tracker_sync_timer = app_timer_register(250, tracker_chunk_timer_callback, NULL);
+      s_tracker_sync_timer = app_timer_register(300, tracker_chunk_timer_callback, NULL);
     }
     return;
   }
@@ -3509,14 +3688,15 @@ static void outbox_failed_callback(DictionaryIterator *iter, AppMessageResult re
 static void connection_handler(bool connected) {
   s_phone_connected = connected;
   update_header();
+  if (s_tracker_header_layer) layer_mark_dirty(s_tracker_header_layer);
 
   if (connected) {
     if (s_tracker_sync_state == TRACKER_SYNC_SENDING_START) {
       if (s_tracker_sync_timer) app_timer_cancel(s_tracker_sync_timer);
-      s_tracker_sync_timer = app_timer_register(100, tracker_sync_start_timer_callback, NULL);
+      s_tracker_sync_timer = app_timer_register(300, tracker_sync_start_timer_callback, NULL);
     } else if (s_tracker_sync_state == TRACKER_SYNC_SENDING_CHUNKS || s_tracker_sync_state == TRACKER_SYNC_SENDING_END) {
       if (s_tracker_sync_timer) app_timer_cancel(s_tracker_sync_timer);
-      s_tracker_sync_timer = app_timer_register(100, tracker_chunk_timer_callback, NULL);
+      s_tracker_sync_timer = app_timer_register(300, tracker_chunk_timer_callback, NULL);
     }
   }
 }

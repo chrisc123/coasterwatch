@@ -226,14 +226,50 @@ test('switching the park <select> shows only that park\'s ride list', () => {
   const select = document.querySelector('select');
   const energylandiaGroup = document.querySelector('.rl-park[data-park="317"]');
   const thorpeGroup = document.querySelector('.rl-park[data-park="2"]');
+  const chessingtonGroup = document.querySelector('.rl-park[data-park="3"]');
   assert.ok(!energylandiaGroup.classList.contains('hide'), 'Energylandia should be the initially active park');
   assert.ok(thorpeGroup.classList.contains('hide'), 'Thorpe Park should start hidden');
+  assert.ok(chessingtonGroup.classList.contains('hide'), 'Chessington should start hidden');
 
-  select.value = '2';
+  select.value = '3';
   select.dispatchEvent(new window.Event('change', { bubbles: true }));
 
   assert.ok(energylandiaGroup.classList.contains('hide'), 'Energylandia should hide after switching away from it');
-  assert.ok(!thorpeGroup.classList.contains('hide'), 'Thorpe Park should show once selected');
+  assert.ok(thorpeGroup.classList.contains('hide'), 'Thorpe Park should remain hidden');
+  assert.ok(!chessingtonGroup.classList.contains('hide'), 'Chessington should show once selected');
+
+  // Verify Chessington's 5 default visible roller coasters are checked
+  const mandrill = chessingtonGroup.querySelector('input[data-id="11814"]');
+  const vampire = chessingtonGroup.querySelector('input[data-id="83"]');
+  const dragonsFury = chessingtonGroup.querySelector('input[data-id="65"]');
+  const rattlesnake = chessingtonGroup.querySelector('input[data-id="74"]');
+  const chase = chessingtonGroup.querySelector('input[data-id="16457"]');
+  const carousel = chessingtonGroup.querySelector('input[data-id="4574"]');
+  assert.ok(mandrill && mandrill.checked, 'Mandrill Mayhem should be checked by default');
+  assert.ok(vampire && vampire.checked, 'Vampire should be checked by default');
+  assert.ok(dragonsFury && dragonsFury.checked, "Dragon's Fury should be checked by default");
+  assert.ok(rattlesnake && rattlesnake.checked, 'Rattlesnake should be checked by default');
+  assert.ok(chase && chase.checked, "Chase's Mountain Mission should be checked by default");
+  assert.ok(carousel && !carousel.checked, 'Adventure Tree Carousel should be unchecked by default');
+});
+
+test('full save round-trip: Chessington selection persists and survives a reopen', () => {
+  const pkjs = loadPkjs();
+  let page = renderSettingsPage(pkjs);
+
+  // Switch to Chessington World of Adventures.
+  const select = page.document.querySelector('select');
+  select.value = '3';
+  select.dispatchEvent(new page.window.Event('change', { bubbles: true }));
+
+  closeSettingsPage(pkjs, page);
+
+  assert.strictEqual(pkjs.getSelectedParkId(), 3, 'park selection should have persisted as Chessington (3)');
+
+  // Reopen from scratch, as happens after any webview close.
+  page = renderSettingsPage(pkjs);
+  const reopenedSelect = page.document.querySelector('select');
+  assert.strictEqual(reopenedSelect.value, '3', 'Park select should reopen showing Chessington');
 });
 
 test('full save round-trip: park switch and band colors persist and survive a reopen', () => {
